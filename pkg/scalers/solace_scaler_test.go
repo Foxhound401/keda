@@ -4,28 +4,33 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 
 	v2 "k8s.io/api/autoscaling/v2"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type testSolaceMetadata struct {
-	testID      string
-	metadata    map[string]string
-	scalerIndex int
-	isError     bool
+	testID       string
+	metadata     map[string]string
+	triggerIndex int
+	isError      bool
 }
 
 var (
-	soltestValidBaseURL        = "http://localhost:8080"
-	soltestValidUsername       = "admin"
-	soltestValidPassword       = "admin"
-	soltestValidVpn            = "dennis_vpn"
-	soltestValidQueueName      = "queue3"
-	soltestValidMsgCountTarget = "10"
-	soltestValidMsgSpoolTarget = "20"
-	soltestEnvUsername         = "SOLTEST_USERNAME"
-	soltestEnvPassword         = "SOLTEST_PASSWORD"
+	soltestValidBaseURL         = "http://localhost:8080"
+	soltestValidUsername        = "admin"
+	soltestValidPassword        = "admin"
+	soltestValidVpn             = "dennis_vpn"
+	soltestValidQueueName       = "queue3"
+	soltestValidMsgCountTarget  = "10"
+	soltestValidMsgSpoolTarget  = "20"
+	soltestValidMsgRxRateTarget = "15"
+	soltestEnvUsername          = "SOLTEST_USERNAME"
+	soltestEnvPassword          = "SOLTEST_PASSWORD"
 )
 
 // AUTH RECORD FOR TEST
@@ -208,6 +213,56 @@ var testParseSolaceMetadata = []testSolaceMetadata{
 			solaceMetaPassword:            soltestValidPassword,
 			solaceMetaQueueName:           soltestValidQueueName,
 			solaceMetaMsgSpoolUsageTarget: soltestValidMsgSpoolTarget,
+		},
+		1,
+		false,
+	},
+	// -Case - msgRxRateTarget non-numeric
+	{
+		"#014 - msgRxRateTarget non-numeric",
+		map[string]string{
+			solaceMetaSempBaseURL:     soltestValidBaseURL,
+			solaceMetaMsgVpn:          soltestValidVpn,
+			solaceMetaUsernameFromEnv: "",
+			solaceMetaPasswordFromEnv: "",
+			solaceMetaUsername:        soltestValidUsername,
+			solaceMetaPassword:        soltestValidPassword,
+			solaceMetaQueueName:       soltestValidQueueName,
+			solaceMetaMsgRxRateTarget: "NOT_AN_INTEGER",
+		},
+		1,
+		true,
+	},
+	// -Case - activationMsgRxRateTarget non-numeric
+	{
+		"#015 - activationMsgRxRateTarget non-numeric",
+		map[string]string{
+			solaceMetaSempBaseURL:               soltestValidBaseURL,
+			solaceMetaMsgVpn:                    soltestValidVpn,
+			solaceMetaUsernameFromEnv:           "",
+			solaceMetaPasswordFromEnv:           "",
+			solaceMetaUsername:                  soltestValidUsername,
+			solaceMetaPassword:                  soltestValidPassword,
+			solaceMetaQueueName:                 soltestValidQueueName,
+			solaceMetaMsgRxRateTarget:           "10",
+			solaceMetaActivationMsgRxRateTarget: "NOT_AN_INTEGER",
+		},
+		1,
+		true,
+	},
+	// +Case - Properly encode queueName
+	{
+		"#016 - Properly Encode QueueName- ",
+		map[string]string{
+			"":                        "",
+			solaceMetaSempBaseURL:     soltestValidBaseURL,
+			solaceMetaMsgVpn:          soltestValidVpn,
+			solaceMetaUsernameFromEnv: "",
+			solaceMetaPasswordFromEnv: "",
+			solaceMetaUsername:        soltestValidUsername,
+			solaceMetaPassword:        soltestValidPassword,
+			solaceMetaQueueName:       "with/slash",
+			solaceMetaMsgCountTarget:  soltestValidMsgCountTarget,
 		},
 		1,
 		false,
@@ -399,17 +454,87 @@ var testSolaceGetMetricSpecData = []testSolaceMetadata{
 		1,
 		false,
 	},
+	// Added for 'solaceMetaMsgRxRateTarget'
+	{
+		"#410 - Get Metric Spec - msgRxRateTarget",
+		map[string]string{
+			solaceMetaSempBaseURL:     soltestValidBaseURL,
+			solaceMetaMsgVpn:          soltestValidVpn,
+			solaceMetaUsernameFromEnv: "",
+			solaceMetaPasswordFromEnv: "",
+			solaceMetaUsername:        soltestValidUsername,
+			solaceMetaPassword:        soltestValidPassword,
+			solaceMetaQueueName:       soltestValidQueueName,
+			solaceMetaMsgCountTarget:  soltestValidMsgCountTarget,
+			//			solaceMetaMsgSpoolUsageTarget: soltestValidMsgSpoolTarget,
+			solaceMetaMsgRxRateTarget: soltestValidMsgRxRateTarget,
+		},
+		1,
+		false,
+	},
+	{
+		"#411 - Get Metric Spec - ALL msgSpoolUsage, msgCountTarget, and msgRxRateTarget",
+		map[string]string{
+			solaceMetaSempBaseURL:         soltestValidBaseURL,
+			solaceMetaMsgVpn:              soltestValidVpn,
+			solaceMetaUsernameFromEnv:     "",
+			solaceMetaPasswordFromEnv:     "",
+			solaceMetaUsername:            soltestValidUsername,
+			solaceMetaPassword:            soltestValidPassword,
+			solaceMetaQueueName:           soltestValidQueueName,
+			solaceMetaMsgCountTarget:      soltestValidMsgCountTarget,
+			solaceMetaMsgSpoolUsageTarget: soltestValidMsgSpoolTarget,
+			solaceMetaMsgRxRateTarget:     soltestValidMsgRxRateTarget,
+		},
+		1,
+		false,
+	},
+	{
+		"#412 - Get Metric Spec - ALL ZERO",
+		map[string]string{
+			solaceMetaSempBaseURL:         soltestValidBaseURL,
+			solaceMetaMsgVpn:              soltestValidVpn,
+			solaceMetaUsernameFromEnv:     "",
+			solaceMetaPasswordFromEnv:     "",
+			solaceMetaUsername:            soltestValidUsername,
+			solaceMetaPassword:            soltestValidPassword,
+			solaceMetaQueueName:           soltestValidQueueName,
+			solaceMetaMsgCountTarget:      "0",
+			solaceMetaMsgSpoolUsageTarget: "0",
+			solaceMetaMsgRxRateTarget:     "0",
+		},
+		1,
+		true,
+	},
+	{
+		"#413 - Get Metric Spec - msgRxRateTarget, OTHERS ZERO",
+		map[string]string{
+			solaceMetaSempBaseURL:         soltestValidBaseURL,
+			solaceMetaMsgVpn:              soltestValidVpn,
+			solaceMetaUsernameFromEnv:     "",
+			solaceMetaPasswordFromEnv:     "",
+			solaceMetaUsername:            soltestValidUsername,
+			solaceMetaPassword:            soltestValidPassword,
+			solaceMetaQueueName:           soltestValidQueueName,
+			solaceMetaMsgCountTarget:      "0",
+			solaceMetaMsgSpoolUsageTarget: "0",
+			solaceMetaMsgRxRateTarget:     soltestValidMsgRxRateTarget,
+		},
+		1,
+		false,
+	},
 }
 
 var testSolaceExpectedMetricNames = map[string]string{
 	"s1-" + solaceScalerID + "-" + soltestValidQueueName + "-" + solaceTriggermsgcount:      "",
 	"s1-" + solaceScalerID + "-" + soltestValidQueueName + "-" + solaceTriggermsgspoolusage: "",
+	"s1-" + solaceScalerID + "-" + soltestValidQueueName + "-" + solaceTriggermsgrxrate:     "",
 }
 
 func TestSolaceParseSolaceMetadata(t *testing.T) {
 	for _, testData := range testParseSolaceMetadata {
 		fmt.Print(testData.testID)
-		_, err := parseSolaceMetadata(&ScalerConfig{ResolvedEnv: nil, TriggerMetadata: testData.metadata, AuthParams: nil, ScalerIndex: testData.scalerIndex})
+		meta, err := parseSolaceMetadata(&scalersconfig.ScalerConfig{ResolvedEnv: nil, TriggerMetadata: testData.metadata, AuthParams: nil, TriggerIndex: testData.triggerIndex})
 		switch {
 		case err != nil && !testData.isError:
 			t.Error("expected success but got error: ", err)
@@ -420,10 +545,14 @@ func TestSolaceParseSolaceMetadata(t *testing.T) {
 		default:
 			fmt.Println(" --> PASS")
 		}
+		if !testData.isError && strings.Contains(testData.metadata["queueName"], "/") && !strings.Contains(meta.EndpointURL, url.QueryEscape(testData.metadata["queueName"])) {
+			t.Error("expected endpointURL to query escape special characters in the URL but got:", meta.EndpointURL)
+			fmt.Println(" --> FAIL")
+		}
 	}
 	for _, testData := range testSolaceEnvCreds {
 		fmt.Print(testData.testID)
-		_, err := parseSolaceMetadata(&ScalerConfig{ResolvedEnv: testDataSolaceResolvedEnvVALID, TriggerMetadata: testData.metadata, AuthParams: nil, ScalerIndex: testData.scalerIndex})
+		_, err := parseSolaceMetadata(&scalersconfig.ScalerConfig{ResolvedEnv: testDataSolaceResolvedEnvVALID, TriggerMetadata: testData.metadata, AuthParams: nil, TriggerIndex: testData.triggerIndex})
 		switch {
 		case err != nil && !testData.isError:
 			t.Error("expected success but got error: ", err)
@@ -437,7 +566,7 @@ func TestSolaceParseSolaceMetadata(t *testing.T) {
 	}
 	for _, testData := range testSolaceK8sSecretCreds {
 		fmt.Print(testData.testID)
-		_, err := parseSolaceMetadata(&ScalerConfig{ResolvedEnv: nil, TriggerMetadata: testData.metadata, AuthParams: testDataSolaceAuthParamsVALID, ScalerIndex: testData.scalerIndex})
+		_, err := parseSolaceMetadata(&scalersconfig.ScalerConfig{ResolvedEnv: nil, TriggerMetadata: testData.metadata, AuthParams: testDataSolaceAuthParamsVALID, TriggerIndex: testData.triggerIndex})
 		switch {
 		case err != nil && !testData.isError:
 			t.Error("expected success but got error: ", err)
@@ -457,7 +586,7 @@ func TestSolaceGetMetricSpec(t *testing.T) {
 		fmt.Print(testData.testID)
 		var err error
 		var solaceMeta *SolaceMetadata
-		solaceMeta, err = parseSolaceMetadata(&ScalerConfig{ResolvedEnv: testDataSolaceResolvedEnvVALID, TriggerMetadata: testData.metadata, AuthParams: testDataSolaceAuthParamsVALID, ScalerIndex: testData.scalerIndex})
+		solaceMeta, err = parseSolaceMetadata(&scalersconfig.ScalerConfig{ResolvedEnv: testDataSolaceResolvedEnvVALID, TriggerMetadata: testData.metadata, AuthParams: testDataSolaceAuthParamsVALID, TriggerIndex: testData.triggerIndex})
 		if err != nil {
 			fmt.Printf("\n       Failed to parse metadata: %v", err)
 		} else {

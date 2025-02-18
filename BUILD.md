@@ -5,7 +5,7 @@
 **Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
 
 - [Building](#building)
-  - [Quick start with Visual Studio Code Remote - Containers](#quick-start-with-visual-studio-code-remote---containers)
+  - [Quick start with Visual Studio Code Dev Containers](#quick-start-with-visual-studio-code-dev-containers)
   - [Locally directly](#locally-directly)
 - [Deploying](#deploying)
   - [Custom KEDA locally outside cluster](#custom-keda-locally-outside-cluster)
@@ -25,14 +25,14 @@
 
 ## Building
 
-### Quick start with [Visual Studio Code Remote - Containers](https://code.visualstudio.com/docs/remote/containers)
+### Quick start with [Visual Studio Code Dev Containers](https://code.visualstudio.com/docs/remote/containers)
 
 This helps you pull and build quickly - dev containers launch the project inside a container with all the tooling
 required for a consistent and seamless developer experience.
 
 This means you don't have to install and configure your dev environment as the container handles this for you.
 
-To get started install [VSCode](https://code.visualstudio.com/) and the [Remote Containers extensions](
+To get started install [VSCode](https://code.visualstudio.com/) and the [Dev Containers extensions](
 https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
 
 Clone the repo and launch code:
@@ -43,7 +43,7 @@ cd keda
 code .
 ```
 
-Once VSCode launches run `CTRL+SHIFT+P -> Remote-Containers: Reopen in container` and then use the integrated
+Once VSCode launches run `CTRL+SHIFT+P -> Dev Containers: Reopen in container` and then use the integrated
 terminal to run:
 
 ```bash
@@ -57,7 +57,7 @@ make build
 
 This project is using [Operator SDK framework](https://github.com/operator-framework/operator-sdk), make sure you
 have installed the right version. To check the current version used for KEDA check the `RELEASE_VERSION` in file
-[tools/build-tools.Dockerfile](https://github.com/kedacore/keda/blob/main/tools/build-tools.Dockerfile).
+[github.com/test-tools/tools/Dockerfile](https://github.com/kedacore/test-tools/blob/main/tools/Dockerfile).
 
 ```bash
 git clone git@github.com:kedacore/keda.git
@@ -128,6 +128,16 @@ to deploy it as part of KEDA. Do the following:
     ```
 
 ## Debugging with VS Code
+
+KEDA uses certificates to encrypt any HTTP communication. Inside the cluster, certificates are mounted from a secret but locally debugging that isn't possible, so the generation of those certificates is required (or KEDA won't start).
+
+All components inspect the folder `/certs` for any certificates inside it. Argument `--cert-dir` can be used to specify another folder to be used as a source for certificates. You can generate the certificates (assuming the default path) using `openssl`:
+
+```bash
+mkdir -p /certs
+openssl req -newkey rsa:2048 -subj '/CN=localhost' -nodes -keyout /certs/tls.key -x509 -days 3650 -out /certs/tls.crt
+cp /certs/tls.crt /certs/ca.crt
+```
 
 ### Operator
 
@@ -258,7 +268,7 @@ Follow these instructions if you want to debug the KEDA webhook using VS Code.
    Refer to [this](https://code.visualstudio.com/docs/editor/debugging) for more information about debugging with VS Code.
 2. Expose your local instance to internet. If you can't expose it directly, you can use something like [localtunnel](https://theboroer.github.io/localtunnel-www/) using the command `lt --port 9443 --local-https --allow-invalid-cert` after installing the tool.
 
-3. Update the `admissing_webhooks.yaml` in `config/webhooks`, replacing the section (but not commiting this change)
+3. Update the `admissing_webhooks.yaml` in `config/webhooks`, replacing the section (but not committing this change)
    ```yaml
    webhooks:
    - admissionReviewVersions:
@@ -277,7 +287,8 @@ Follow these instructions if you want to debug the KEDA webhook using VS Code.
      clientConfig:
        url: "https://${YOUR_URL}/validate-keda-sh-v1alpha1-scaledobject"
    ```
-   **Note:** You could need to define also the key `caBundle` with the CA bundle encoded in base64 if the cluster can get it during the manifest apply (this happens with localtunnel for instance)
+   **Note:** You need to define also the key `caBundle` with the CA bundle encoded in base64. This `caBundle` is the pem file from the CA used to sign the certificate. Remember to disable the `caBundle` inyection to avoid unintended rewrites of your `caBundle` (by KEDA operator or by any other 3rd party)
+
 
 4. Deploy CRDs and KEDA into `keda` namespace
    ```bash

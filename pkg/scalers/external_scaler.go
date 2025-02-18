@@ -3,6 +3,7 @@ package scalers
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ import (
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
 	pb "github.com/kedacore/keda/v2/pkg/scalers/externalscaler"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
+	"github.com/kedacore/keda/v2/pkg/util"
 )
 
 type externalScaler struct {
@@ -32,9 +35,12 @@ type externalPushScaler struct {
 
 type externalScalerMetadata struct {
 	scalerAddress    string
-	tlsCertFile      string
 	originalMetadata map[string]string
-	scalerIndex      int
+	triggerIndex     int
+	caCert           string
+	tlsClientCert    string
+	tlsClientKey     string
+	unsafeSsl        bool
 }
 
 type connectionGroup struct {
@@ -44,9 +50,11 @@ type connectionGroup struct {
 // a pool of connectionGroup per metadata hash
 var connectionPool sync.Map
 
+const grpcConfig = `{"loadBalancingConfig": [{"round_robin":{}}]}`
+
 // NewExternalScaler creates a new external scaler - calls the GRPC interface
 // to create a new scaler
-func NewExternalScaler(config *ScalerConfig) (Scaler, error) {
+func NewExternalScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting external scaler metric type: %w", err)
@@ -70,7 +78,7 @@ func NewExternalScaler(config *ScalerConfig) (Scaler, error) {
 }
 
 // NewExternalPushScaler creates a new externalPushScaler push scaler
-func NewExternalPushScaler(config *ScalerConfig) (PushScaler, error) {
+func NewExternalPushScaler(config *scalersconfig.ScalerConfig) (PushScaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting external scaler metric type: %w", err)
@@ -95,7 +103,7 @@ func NewExternalPushScaler(config *ScalerConfig) (PushScaler, error) {
 	}, nil
 }
 
-func parseExternalScalerMetadata(config *ScalerConfig) (externalScalerMetadata, error) {
+func parseExternalScalerMetadata(config *scalersconfig.ScalerConfig) (externalScalerMetadata, error) {
 	meta := externalScalerMetadata{
 		originalMetadata: config.TriggerMetadata,
 	}
@@ -107,12 +115,27 @@ func parseExternalScalerMetadata(config *ScalerConfig) (externalScalerMetadata, 
 		return meta, fmt.Errorf("scaler Address is a required field")
 	}
 
-	if val, ok := config.TriggerMetadata["tlsCertFile"]; ok && val != "" {
-		meta.tlsCertFile = val
+	meta.originalMetadata = make(map[string]string)
+	if val, ok := config.AuthParams["caCert"]; ok {
+		meta.caCert = val
 	}
 
-	meta.originalMetadata = make(map[string]string)
+	if val, ok := config.AuthParams["tlsClientCert"]; ok {
+		meta.tlsClientCert = val
+	}
 
+	if val, ok := config.AuthParams["tlsClientKey"]; ok {
+		meta.tlsClientKey = val
+	}
+
+	meta.unsafeSsl = false
+	if val, ok := config.TriggerMetadata["unsafeSsl"]; ok && val != "" {
+		boolVal, err := strconv.ParseBool(val)
+		if err != nil {
+			return meta, fmt.Errorf("failed to parse insecureSkipVerify value. Must be either true or false")
+		}
+		meta.unsafeSsl = boolVal
+	}
 	// Add elements to metadata
 	for key, value := range config.TriggerMetadata {
 		// Check if key is in resolved environment and resolve
@@ -124,24 +147,8 @@ func parseExternalScalerMetadata(config *ScalerConfig) (externalScalerMetadata, 
 			meta.originalMetadata[key] = value
 		}
 	}
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 	return meta, nil
-}
-
-// IsActive checks if there are any messages in the subscription
-func (s *externalScaler) IsActive(ctx context.Context) (bool, error) {
-	grpcClient, err := getClientForConnectionPool(s.metadata)
-	if err != nil {
-		return false, err
-	}
-
-	response, err := grpcClient.IsActive(ctx, &s.scaledObjectRef)
-	if err != nil {
-		s.logger.Error(err, "error calling IsActive on external scaler")
-		return false, err
-	}
-
-	return response.Result, nil
 }
 
 func (s *externalScaler) Close(context.Context) error {
@@ -167,9 +174,13 @@ func (s *externalScaler) GetMetricSpecForScaling(ctx context.Context) []v2.Metri
 	for _, spec := range response.MetricSpecs {
 		externalMetric := &v2.ExternalMetricSource{
 			Metric: v2.MetricIdentifier{
-				Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, spec.MetricName),
+				Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, spec.MetricName),
 			},
-			Target: GetMetricTarget(s.metricType, spec.TargetSize),
+		}
+		if spec.TargetSizeFloat > 0 {
+			externalMetric.Target = GetMetricTargetMili(s.metricType, spec.TargetSizeFloat)
+		} else {
+			externalMetric.Target = GetMetricTarget(s.metricType, spec.TargetSize)
 		}
 
 		// Create the metric spec for the HPA
@@ -184,18 +195,18 @@ func (s *externalScaler) GetMetricSpecForScaling(ctx context.Context) []v2.Metri
 	return result
 }
 
-// GetMetrics connects calls the gRPC interface to get the metrics with a specific name
-func (s *externalScaler) GetMetrics(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, error) {
+// GetMetricsAndActivity returns value for a supported metric and an error if there is a problem getting the metric
+func (s *externalScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	var metrics []external_metrics.ExternalMetricValue
 	grpcClient, err := getClientForConnectionPool(s.metadata)
 	if err != nil {
-		return metrics, err
+		return []external_metrics.ExternalMetricValue{}, false, err
 	}
 
 	// Remove the sX- prefix as the external scaler shouldn't have to know about it
-	metricNameWithoutIndex, err := RemoveIndexFromMetricName(s.metadata.scalerIndex, metricName)
+	metricNameWithoutIndex, err := RemoveIndexFromMetricName(s.metadata.triggerIndex, metricName)
 	if err != nil {
-		return metrics, err
+		return []external_metrics.ExternalMetricValue{}, false, err
 	}
 
 	request := &pb.GetMetricsRequest{
@@ -203,35 +214,28 @@ func (s *externalScaler) GetMetrics(ctx context.Context, metricName string) ([]e
 		ScaledObjectRef: &s.scaledObjectRef,
 	}
 
-	response, err := grpcClient.GetMetrics(ctx, request)
+	metricsResponse, err := grpcClient.GetMetrics(ctx, request)
 	if err != nil {
 		s.logger.Error(err, "error")
-		return []external_metrics.ExternalMetricValue{}, err
+		return []external_metrics.ExternalMetricValue{}, false, err
 	}
 
-	for _, metricResult := range response.MetricValues {
-		metric := GenerateMetricInMili(metricName, float64(metricResult.MetricValue))
+	for _, metricResult := range metricsResponse.MetricValues {
+		value := float64(metricResult.MetricValue)
+		if metricResult.MetricValueFloat > 0 {
+			value = metricResult.MetricValueFloat
+		}
+		metric := GenerateMetricInMili(metricName, value)
 		metrics = append(metrics, metric)
 	}
 
-	return metrics, nil
-}
-
-// TODO merge isActive() and GetMetrics()
-func (s *externalScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
-	metrics, err := s.GetMetrics(ctx, metricName)
+	isActiveResponse, err := grpcClient.IsActive(ctx, &s.scaledObjectRef)
 	if err != nil {
-		s.logger.Error(err, "error getting metrics")
+		s.logger.Error(err, "error calling IsActive on external scaler")
 		return []external_metrics.ExternalMetricValue{}, false, err
 	}
 
-	isActive, err := s.IsActive(ctx)
-	if err != nil {
-		s.logger.Error(err, "error getting activity status")
-		return []external_metrics.ExternalMetricValue{}, false, err
-	}
-
-	return metrics, isActive, nil
+	return metrics, isActiveResponse.Result, nil
 }
 
 // handleIsActiveStream is the only writer to the active channel and will close it on return.
@@ -250,7 +254,7 @@ func (s *externalPushScaler) Run(ctx context.Context, active chan<- bool) {
 		}
 	}
 
-	// retry on error from runWithLog() starting by 2 sec backing off * 2 with a max of 1 minute
+	// retry on error from runWithLog() starting by 2 sec backing off * 2 with a max of 2 minute
 	retryDuration := time.Second * 2
 	// the caller of this function needs to ensure that they call Stop() on the resulting
 	// timer, to release background resources.
@@ -305,15 +309,21 @@ func getClientForConnectionPool(metadata externalScalerMetadata) (pb.ExternalSca
 	defer connectionPoolMutex.Unlock()
 
 	buildGRPCConnection := func(metadata externalScalerMetadata) (*grpc.ClientConn, error) {
-		if metadata.tlsCertFile != "" {
-			creds, err := credentials.NewClientTLSFromFile(metadata.tlsCertFile, "")
-			if err != nil {
-				return nil, err
-			}
-			return grpc.Dial(metadata.scalerAddress, grpc.WithTransportCredentials(creds))
+		tlsConfig, err := util.NewTLSConfig(metadata.tlsClientCert, metadata.tlsClientKey, metadata.caCert, metadata.unsafeSsl)
+		if err != nil {
+			return nil, err
 		}
 
-		return grpc.Dial(metadata.scalerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if len(tlsConfig.Certificates) > 0 || metadata.caCert != "" {
+			// nosemgrep: go.grpc.ssrf.grpc-tainted-url-host.grpc-tainted-url-host
+			return grpc.NewClient(metadata.scalerAddress,
+				grpc.WithDefaultServiceConfig(grpcConfig),
+				grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+		}
+
+		return grpc.NewClient(metadata.scalerAddress,
+			grpc.WithDefaultServiceConfig(grpcConfig),
+			grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
 	// create a unique key per-metadata. If scaledObjects share the same connection properties

@@ -43,14 +43,9 @@ spec:
     spec:
       containers:
       - name: {{.DeploymentName}}
-        image: k8s.gcr.io/hpa-example
+        image: registry.k8s.io/hpa-example
         ports:
         - containerPort: 80
-        resources:
-          limits:
-            cpu: 500m
-          requests:
-            cpu: 200m
         imagePullPolicy: IfNotPresent
 `
 
@@ -64,14 +59,16 @@ spec:
   scaleTargetRef:
     name: {{.DeploymentName}}
   pollingInterval: 5
-  minReplicaCount: 0
+  minReplicaCount: 1
   maxReplicaCount: 1
   cooldownPeriod: 10
   triggers:
-    - type: cpu
-      metadata:
-        type: Utilization
-        value: "50"
+  - type: metrics-api
+    metadata:
+      targetValue: "2"
+      url: "invalid-invalid"
+      valueLocation: 'value'
+      method: "query"
 `
 
 	scaledObjectTemplateWithCustomName = `
@@ -90,10 +87,12 @@ spec:
     horizontalPodAutoscalerConfig:
       name: {{.CustomHpaName}}
   triggers:
-      - type: cpu
-        metadata:
-          type: Utilization
-          value: "50"
+  - type: metrics-api
+    metadata:
+      targetValue: "2"
+      url: "invalid-invalid"
+      valueLocation: 'value'
+      method: "query"
 `
 )
 
@@ -150,7 +149,7 @@ func test(t *testing.T, testName string, firstHpaName string, firstSOTemplate st
 	assert.True(t, errors.IsNotFound(err))
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 }
 
 func getTemplateData(testNamespace string, deploymentName string, scaledObjectName string, customHpaName string) templateData {
