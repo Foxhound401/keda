@@ -50,7 +50,7 @@ func Retry(ctx context.Context, eventName log.Event, operation string, fn func(c
 	for i := int32(0); i <= ro.MaxRetries; i++ {
 		if i > 0 {
 			sleep := calcDelay(ro, i)
-			log.Writef(eventName, "(%s) Retry attempt %d sleeping for %s", operation, i, sleep)
+			log.Writef(eventName, "%s Retry attempt %d sleeping for %s", operation, i, sleep)
 
 			select {
 			case <-ctx.Done():
@@ -66,7 +66,7 @@ func Retry(ctx context.Context, eventName log.Event, operation string, fn func(c
 		err = fn(ctx, &args)
 
 		if args.resetAttempts {
-			log.Writef(eventName, "(%s) Resetting retry attempts", operation)
+			log.Writef(eventName, "%s Resetting retry attempts", operation)
 
 			// it looks weird, but we're doing -1 here because the post-increment
 			// will set it back to 0, which is what we want - go back to the 0th
@@ -79,13 +79,13 @@ func Retry(ctx context.Context, eventName log.Event, operation string, fn func(c
 		if err != nil {
 			if isFatalFn(err) {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					log.Writef(eventName, "(%s) Retry attempt %d was cancelled, stopping: %s", operation, i, err.Error())
+					log.Writef(eventName, "%s Retry attempt %d was cancelled, stopping: %s", operation, i, err.Error())
 				} else {
-					log.Writef(eventName, "(%s) Retry attempt %d returned non-retryable error: %s", operation, i, err.Error())
+					log.Writef(eventName, "%s Retry attempt %d returned non-retryable error: %s", operation, i, err.Error())
 				}
 				return err
 			} else {
-				log.Writef(eventName, "(%s) Retry attempt %d returned retryable error: %s", operation, i, err.Error())
+				log.Writef(eventName, "%s Retry attempt %d returned retryable error: %s", operation, i, err.Error())
 			}
 
 			continue
@@ -117,25 +117,33 @@ func setDefaults(o *exported.RetryOptions) {
 }
 
 // (adapted from from azcore/policy_retry)
-func calcDelay(o exported.RetryOptions, try int32) time.Duration {
-	if try == 0 {
-		return 0
+func calcDelay(o exported.RetryOptions, try int32) time.Duration { // try is >=1; never 0
+	// avoid overflow when shifting left
+	factor := time.Duration(math.MaxInt64)
+	if try < 63 {
+		factor = time.Duration(int64(1<<try) - 1)
 	}
 
-	pow := func(number int64, exponent int32) int64 { // pow is nested helper function
-		var result int64 = 1
-		for n := int32(0); n < exponent; n++ {
-			result *= number
-		}
-		return result
+	delay := factor * o.RetryDelay
+	if delay < factor {
+		// overflow has happened so set to max value
+		delay = time.Duration(math.MaxInt64)
 	}
 
-	delay := time.Duration(pow(2, try)-1) * o.RetryDelay
+	// Introduce jitter:  [0.0, 1.0) / 2 = [0.0, 0.5) + 0.8 = [0.8, 1.3)
+	jitterMultiplier := rand.Float64()/2 + 0.8 // NOTE: We want math/rand; not crypto/rand
 
-	// Introduce some jitter:  [0.0, 1.0) / 2 = [0.0, 0.5) + 0.8 = [0.8, 1.3)
-	delay = time.Duration(delay.Seconds() * (rand.Float64()/2 + 0.8) * float64(time.Second)) // NOTE: We want math/rand; not crypto/rand
-	if delay > o.MaxRetryDelay {
+	delayFloat := float64(delay) * jitterMultiplier
+	if delayFloat > float64(math.MaxInt64) {
+		// the jitter pushed us over MaxInt64, so just use MaxInt64
+		delay = time.Duration(math.MaxInt64)
+	} else {
+		delay = time.Duration(delayFloat)
+	}
+
+	if delay > o.MaxRetryDelay { // MaxRetryDelay is backfilled with non-negative value
 		delay = o.MaxRetryDelay
 	}
+
 	return delay
 }

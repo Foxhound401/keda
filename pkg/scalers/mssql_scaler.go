@@ -15,7 +15,7 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
-	kedautil "github.com/kedacore/keda/v2/pkg/util"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 var (
@@ -64,16 +64,13 @@ type mssqlMetadata struct {
 	// The threshold that is used in activation phase
 	// +optional
 	activationTargetValue float64
-	// The name of the metric to use in the Horizontal Pod Autoscaler. This value will be prefixed with "mssql-".
-	// +optional
-	metricName string
 	// The index of the scaler inside the ScaledObject
 	// +internal
-	scalerIndex int
+	triggerIndex int
 }
 
 // NewMSSQLScaler creates a new mssql scaler
-func NewMSSQLScaler(config *ScalerConfig) (Scaler, error) {
+func NewMSSQLScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -100,7 +97,7 @@ func NewMSSQLScaler(config *ScalerConfig) (Scaler, error) {
 }
 
 // parseMSSQLMetadata takes a ScalerConfig and returns a mssqlMetadata or an error if the config is invalid
-func parseMSSQLMetadata(config *ScalerConfig) (*mssqlMetadata, error) {
+func parseMSSQLMetadata(config *scalersconfig.ScalerConfig) (*mssqlMetadata, error) {
 	meta := mssqlMetadata{}
 
 	// Query
@@ -118,7 +115,11 @@ func parseMSSQLMetadata(config *ScalerConfig) (*mssqlMetadata, error) {
 		}
 		meta.targetValue = targetValue
 	} else {
-		return nil, ErrMsSQLNoTargetValue
+		if config.AsMetricSource {
+			meta.targetValue = 0
+		} else {
+			return nil, ErrMsSQLNoTargetValue
+		}
 	}
 
 	// Activation target value
@@ -168,21 +169,7 @@ func parseMSSQLMetadata(config *ScalerConfig) (*mssqlMetadata, error) {
 			meta.password = config.ResolvedEnv[config.TriggerMetadata["passwordFromEnv"]]
 		}
 	}
-
-	// get the metricName, which can be explicit or from the (masked) connection string
-	if val, ok := config.TriggerMetadata["metricName"]; ok {
-		meta.metricName = kedautil.NormalizeString(fmt.Sprintf("mssql-%s", val))
-	} else {
-		switch {
-		case meta.database != "":
-			meta.metricName = kedautil.NormalizeString(fmt.Sprintf("mssql-%s", meta.database))
-		case meta.host != "":
-			meta.metricName = kedautil.NormalizeString(fmt.Sprintf("mssql-%s", meta.host))
-		default:
-			meta.metricName = "mssql"
-		}
-	}
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 	return &meta, nil
 }
 
@@ -242,7 +229,7 @@ func getMSSQLConnectionString(meta *mssqlMetadata) string {
 func (s *mssqlScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, s.metadata.metricName),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, "mssql"),
 		},
 		Target: GetMetricTargetMili(s.metricType, s.metadata.targetValue),
 	}

@@ -29,17 +29,24 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	kedastatus "github.com/kedacore/keda/v2/pkg/status"
 )
 
 const (
-	// Default cooldown period for a ScaleTarget if no cooldownPeriod is defined on the scaledObject
-	defaultCooldownPeriod = 5 * 60 // 5 minutes
+	// Default (initial) cooldown period for a ScaleTarget if no cooldownPeriod is defined on the scaledObject
+	defaultInitialCooldownPeriod = 0      // 0 seconds
+	defaultCooldownPeriod        = 5 * 60 // 5 minutes
 )
 
 // ScaleExecutor contains methods RequestJobScale and RequestScale
 type ScaleExecutor interface {
-	RequestJobScale(ctx context.Context, scaledJob *kedav1alpha1.ScaledJob, isActive bool, scaleTo int64, maxScale int64)
-	RequestScale(ctx context.Context, scaledObject *kedav1alpha1.ScaledObject, isActive bool, isError bool)
+	RequestJobScale(ctx context.Context, scaledJob *kedav1alpha1.ScaledJob, isActive bool, isError bool, scaleTo int64, maxScale int64)
+	RequestScale(ctx context.Context, scaledObject *kedav1alpha1.ScaledObject, isActive bool, isError bool, options *ScaleExecutorOptions)
+}
+
+// ScaleExecutorOptions contains the optional parameters for the RequestScale method.
+type ScaleExecutorOptions struct {
+	ActiveTriggers []string
 }
 
 type scaleExecutor struct {
@@ -62,52 +69,47 @@ func NewScaleExecutor(client runtimeclient.Client, scaleClient scale.ScalesGette
 }
 
 func (e *scaleExecutor) updateLastActiveTime(ctx context.Context, logger logr.Logger, object interface{}) error {
-	var patch runtimeclient.Patch
-
 	now := metav1.Now()
-	runtimeObj := object.(runtimeclient.Object)
-	switch obj := runtimeObj.(type) {
-	case *kedav1alpha1.ScaledObject:
-		patch = runtimeclient.MergeFrom(obj.DeepCopy())
-		obj.Status.LastActiveTime = &now
-	case *kedav1alpha1.ScaledJob:
-		patch = runtimeclient.MergeFrom(obj.DeepCopy())
-		obj.Status.LastActiveTime = &now
-	default:
-		err := fmt.Errorf("unknown scalable object type %v", obj)
-		logger.Error(err, "Failed to patch Objects Status")
-		return err
+	transform := func(runtimeObj runtimeclient.Object, target interface{}) error {
+		now, ok := target.(metav1.Time)
+		if !ok {
+			return fmt.Errorf("transform target is not metav1.Time type %v", target)
+		}
+		switch obj := runtimeObj.(type) {
+		case *kedav1alpha1.ScaledObject:
+			obj.Status.LastActiveTime = &now
+		case *kedav1alpha1.ScaledJob:
+			obj.Status.LastActiveTime = &now
+		default:
+		}
+		return nil
 	}
-
-	err := e.client.Status().Patch(ctx, runtimeObj, patch)
-	if err != nil {
-		logger.Error(err, "Failed to patch Objects Status")
-	}
-	return err
+	return kedastatus.TransformObject(ctx, e.client, logger, object, now, transform)
 }
 
 func (e *scaleExecutor) setCondition(ctx context.Context, logger logr.Logger, object interface{}, status metav1.ConditionStatus, reason string, message string, setCondition func(kedav1alpha1.Conditions, metav1.ConditionStatus, string, string)) error {
-	var patch runtimeclient.Patch
-
-	runtimeObj := object.(runtimeclient.Object)
-	switch obj := runtimeObj.(type) {
-	case *kedav1alpha1.ScaledObject:
-		patch = runtimeclient.MergeFrom(obj.DeepCopy())
-		setCondition(obj.Status.Conditions, status, reason, message)
-	case *kedav1alpha1.ScaledJob:
-		patch = runtimeclient.MergeFrom(obj.DeepCopy())
-		setCondition(obj.Status.Conditions, status, reason, message)
-	default:
-		err := fmt.Errorf("unknown scalable object type %v", obj)
-		logger.Error(err, "Failed to patch Objects Status")
-		return err
+	type transformStruct struct {
+		status  metav1.ConditionStatus
+		reason  string
+		message string
 	}
-
-	err := e.client.Status().Patch(ctx, runtimeObj, patch)
-	if err != nil {
-		logger.Error(err, "Failed to patch Objects Status")
+	transform := func(runtimeObj runtimeclient.Object, target interface{}) error {
+		transformObj := target.(*transformStruct)
+		switch obj := runtimeObj.(type) {
+		case *kedav1alpha1.ScaledObject:
+			setCondition(obj.Status.Conditions, transformObj.status, transformObj.reason, transformObj.message)
+		case *kedav1alpha1.ScaledJob:
+			setCondition(obj.Status.Conditions, transformObj.status, transformObj.reason, transformObj.message)
+		default:
+		}
+		return nil
 	}
-	return err
+	target := transformStruct{
+		status:  status,
+		reason:  reason,
+		message: message,
+	}
+	return kedastatus.TransformObject(ctx, e.client, logger, object, &target, transform)
 }
 
 func (e *scaleExecutor) setReadyCondition(ctx context.Context, logger logr.Logger, object interface{}, status metav1.ConditionStatus, reason string, message string) error {
@@ -122,11 +124,4 @@ func (e *scaleExecutor) setActiveCondition(ctx context.Context, logger logr.Logg
 		conditions.SetActiveCondition(status, reason, message)
 	}
 	return e.setCondition(ctx, logger, object, status, reason, message, active)
-}
-
-func (e *scaleExecutor) setFallbackCondition(ctx context.Context, logger logr.Logger, object interface{}, status metav1.ConditionStatus, reason string, message string) error {
-	fallback := func(conditions kedav1alpha1.Conditions, status metav1.ConditionStatus, reason string, message string) {
-		conditions.SetFallbackCondition(status, reason, message)
-	}
-	return e.setCondition(ctx, logger, object, status, reason, message, fallback)
 }

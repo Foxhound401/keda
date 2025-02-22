@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"k8s.io/metrics/pkg/apis/external_metrics"
@@ -36,8 +37,8 @@ type GrpcClient struct {
 	connection *grpc.ClientConn
 }
 
-func NewGrpcClient(url, certDir string) (*GrpcClient, error) {
-	retryPolicy := `{
+func NewGrpcClient(url, certDir, authority string, clientMetrics *grpcprom.ClientMetrics) (*GrpcClient, error) {
+	defaultConfig := `{
 		"methodConfig": [{
 		  "timeout": "3s",
 		  "waitForReady": true,
@@ -55,9 +56,23 @@ func NewGrpcClient(url, certDir string) (*GrpcClient, error) {
 	}
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
-		grpc.WithDefaultServiceConfig(retryPolicy),
+		grpc.WithDefaultServiceConfig(defaultConfig),
 	}
-	conn, err := grpc.Dial(url, opts...)
+
+	opts = append(
+		opts,
+		grpc.WithChainUnaryInterceptor(clientMetrics.UnaryClientInterceptor()),
+		grpc.WithChainStreamInterceptor(clientMetrics.StreamClientInterceptor()),
+	)
+
+	if authority != "" {
+		// If an Authority header override is specified, add it to the client so it is set on every request.
+		// This is useful when the address used to dial the GRPC server does not match any hosts provided in the TLS certificate's
+		// SAN
+		opts = append(opts, grpc.WithAuthority(authority))
+	}
+
+	conn, err := grpc.NewClient(url, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -65,24 +80,19 @@ func NewGrpcClient(url, certDir string) (*GrpcClient, error) {
 	return &GrpcClient{client: api.NewMetricsServiceClient(conn), connection: conn}, nil
 }
 
-// nosemgrep: trailofbits.go.invalid-usage-of-modified-variable.invalid-usage-of-modified-variable
-func (c *GrpcClient) GetMetrics(ctx context.Context, scaledObjectName, scaledObjectNamespace, metricName string) (*external_metrics.ExternalMetricValueList, *api.PromMetricsMsg, error) {
-	response, err := c.client.GetMetrics(ctx, &api.ScaledObjectRef{Name: scaledObjectName, Namespace: scaledObjectNamespace, MetricName: metricName})
+func (c *GrpcClient) GetMetrics(ctx context.Context, scaledObjectName, scaledObjectNamespace, metricName string) (*external_metrics.ExternalMetricValueList, error) {
+	v1beta1ExtMetrics, err := c.client.GetMetrics(ctx, &api.ScaledObjectRef{Name: scaledObjectName, Namespace: scaledObjectNamespace, MetricName: metricName})
 	if err != nil {
-		// in certain cases we would like to get Prometheus metrics even if there's an error
-		// so we can expose information about the error in the client
-		return nil, response.GetPromMetrics(), err
+		return nil, err
 	}
 
 	extMetrics := &external_metrics.ExternalMetricValueList{}
-	err = v1beta1.Convert_v1beta1_ExternalMetricValueList_To_external_metrics_ExternalMetricValueList(response.GetMetrics(), extMetrics, nil)
+	err = v1beta1.Convert_v1beta1_ExternalMetricValueList_To_external_metrics_ExternalMetricValueList(v1beta1ExtMetrics, extMetrics, nil)
 	if err != nil {
-		// in certain cases we would like to get Prometheus metrics even if there's an error
-		// so we can expose information about the error in the client
-		return nil, response.GetPromMetrics(), fmt.Errorf("error when converting metric values %w", err)
+		return nil, fmt.Errorf("error when converting metric values %w", err)
 	}
 
-	return extMetrics, response.GetPromMetrics(), nil
+	return extMetrics, nil
 }
 
 // WaitForConnectionReady waits for gRPC connection to be ready
@@ -106,4 +116,9 @@ func (c *GrpcClient) WaitForConnectionReady(ctx context.Context, logger logr.Log
 		}
 	}
 	return true
+}
+
+// GetServerURL returns url of the gRPC server this client is connected to
+func (c *GrpcClient) GetServerURL() string {
+	return c.connection.Target()
 }

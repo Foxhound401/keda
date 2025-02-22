@@ -9,17 +9,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kubernetesVersion: [v1.26, v1.25, v1.24, v1.23]
+        kubernetesVersion: [v1.32, v1.31, v1.30]
         include:
-        - kubernetesVersion: v1.26
-          kindImage: kindest/node:v1.26.0@sha256:691e24bd2417609db7e589e1a479b902d2e209892a10ce375fab60a8407c7352
-        - kubernetesVersion: v1.25
-          kindImage: kindest/node:v1.25.0@sha256:428aaa17ec82ccde0131cb2d1ca6547d13cf5fdabcc0bbecf749baa935387cbf
-        - kubernetesVersion: v1.24
-          kindImage: kindest/node:v1.24.4@sha256:adfaebada924a26c2c9308edd53c6e33b3d4e453782c0063dc0028bdebaddf98
-        - kubernetesVersion: v1.23
-          kindImage: kindest/node:v1.23.10@sha256:f047448af6a656fae7bc909e2fab360c18c487ef3edc93f06d78cdfd864b2d12
-
+          - kubernetesVersion: v1.32
+            kindImage: kindest/node:v1.32.0@sha256:c48c62eac5da28cdadcf560d1d8616cfa6783b58f0d94cf63ad1bf49600cb027
+          - kubernetesVersion: v1.31
+            kindImage: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
+          - kubernetesVersion: v1.30
+            kindImage: kindest/node:v1.30.8@sha256:17cd608b3971338d9180b00776cb766c50d0a0b6b904ab4ff52fd3fc5c6369bf
     uses: kedacore/keda/.github/workflows/template-smoke-tests.yml@main
     with:
       runs-on: ubuntu-latest

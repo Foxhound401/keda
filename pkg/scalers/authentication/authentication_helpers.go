@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -41,8 +42,10 @@ func GetAuthConfigs(triggerMetadata, authParams map[string]string) (out *AuthMet
 			if out.EnableBasicAuth {
 				return nil, errors.New("both bearer and basic authentication can not be set")
 			}
-
-			out.BearerToken = authParams["bearerToken"]
+			if out.EnableOAuth {
+				return nil, errors.New("both bearer and OAuth can not be set")
+			}
+			out.BearerToken = strings.TrimSuffix(authParams["bearerToken"], "\n")
 			out.EnableBearerAuth = true
 		case BasicAuthType:
 			if len(authParams["username"]) == 0 {
@@ -50,6 +53,9 @@ func GetAuthConfigs(triggerMetadata, authParams map[string]string) (out *AuthMet
 			}
 			if out.EnableBearerAuth {
 				return nil, errors.New("both bearer and basic authentication can not be set")
+			}
+			if out.EnableOAuth {
+				return nil, errors.New("both bearer and OAuth can not be set")
 			}
 
 			out.Username = authParams["username"]
@@ -69,6 +75,35 @@ func GetAuthConfigs(triggerMetadata, authParams map[string]string) (out *AuthMet
 
 			out.Key = authParams["key"]
 			out.EnableTLS = true
+		case CustomAuthType:
+			if len(authParams["customAuthHeader"]) == 0 {
+				return nil, errors.New("no custom auth header given")
+			}
+			out.CustomAuthHeader = strings.TrimSuffix(authParams["customAuthHeader"], "\n")
+
+			if len(authParams["customAuthValue"]) == 0 {
+				return nil, errors.New("no custom auth value given")
+			}
+			out.CustomAuthValue = strings.TrimSuffix(authParams["customAuthValue"], "\n")
+			out.EnableCustomAuth = true
+		case OAuthType:
+			if out.EnableBasicAuth {
+				return nil, errors.New("both oauth and basic authentication can not be set")
+			}
+			if out.EnableBearerAuth {
+				return nil, errors.New("both oauth and bearer authentication can not be set")
+			}
+			out.EnableOAuth = true
+			out.OauthTokenURI = authParams["oauthTokenURI"]
+			out.Scopes = ParseScope(authParams["scope"])
+			out.ClientID = authParams["clientID"]
+			out.ClientSecret = authParams["clientSecret"]
+
+			v, err := ParseEndpointParams(authParams["endpointParams"])
+			if err != nil {
+				return nil, fmt.Errorf("incorrect value for endpointParams is given: %s", authParams["endpointParams"])
+			}
+			out.EndpointParams = v
 		default:
 			return nil, fmt.Errorf("incorrect value for authMode is given: %s", t)
 		}
@@ -81,22 +116,57 @@ func GetAuthConfigs(triggerMetadata, authParams map[string]string) (out *AuthMet
 	return out, err
 }
 
+// ParseScope parse OAuth scopes from a comma separated string
+// whitespace is trimmed
+func ParseScope(inputStr string) []string {
+	scope := strings.TrimSpace(inputStr)
+	if scope != "" {
+		scopes := make([]string, 0)
+		list := strings.Split(scope, ",")
+		for _, sc := range list {
+			sc := strings.TrimSpace(sc)
+			if sc != "" {
+				scopes = append(scopes, sc)
+			}
+		}
+		if len(scopes) == 0 {
+			return nil
+		}
+		return scopes
+	}
+	return nil
+}
+
+// ParseEndpointParams parse OAuth endpoint params from URL-encoded query string.
+func ParseEndpointParams(inputStr string) (url.Values, error) {
+	v, err := url.ParseQuery(inputStr)
+	if err != nil {
+		return nil, err
+	}
+	if len(v) == 0 {
+		return nil, nil
+	}
+	return v, nil
+}
+
 func GetBearerToken(auth *AuthMeta) string {
 	return fmt.Sprintf("Bearer %s", auth.BearerToken)
 }
 
-func NewTLSConfig(auth *AuthMeta) (*tls.Config, error) {
+func NewTLSConfig(auth *AuthMeta, unsafeSsl bool) (*tls.Config, error) {
 	return kedautil.NewTLSConfig(
 		auth.Cert,
 		auth.Key,
 		auth.CA,
+		unsafeSsl,
 	)
 }
 
 func CreateHTTPRoundTripper(roundTripperType TransportType, auth *AuthMeta, conf ...*HTTPTransport) (rt http.RoundTripper, err error) {
-	tlsConfig := &tls.Config{InsecureSkipVerify: false}
+	unsafeSsl := false
+	tlsConfig := kedautil.CreateTLSClientConfig(unsafeSsl)
 	if auth != nil && (auth.CA != "" || auth.EnableTLS) {
-		tlsConfig, err = NewTLSConfig(auth)
+		tlsConfig, err = NewTLSConfig(auth, unsafeSsl)
 		if err != nil || tlsConfig == nil {
 			return nil, fmt.Errorf("error creating the TLS config: %w", err)
 		}
@@ -141,16 +211,16 @@ func CreateHTTPRoundTripper(roundTripperType TransportType, auth *AuthMeta, conf
 		if auth != nil {
 			if auth.EnableBasicAuth {
 				rt = pConfig.NewBasicAuthRoundTripper(
-					auth.Username,
-					pConfig.Secret(auth.Password),
-					"", roundTripper,
+					pConfig.NewInlineSecret(auth.Username),
+					pConfig.NewInlineSecret(auth.Password),
+					roundTripper,
 				)
 			}
 
 			if auth.EnableBearerAuth {
 				rt = pConfig.NewAuthorizationCredentialsRoundTripper(
 					"Bearer",
-					pConfig.Secret(auth.BearerToken),
+					pConfig.NewInlineSecret(auth.BearerToken),
 					roundTripper,
 				)
 			}

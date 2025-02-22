@@ -11,6 +11,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -177,7 +178,7 @@ spec:
     spec:
       containers:
       - name: nginx-deployment
-        image: nginx:1.14.2
+        image: nginxinc/nginx-unprivileged
         ports:
         - containerPort: 80
 `
@@ -186,33 +187,37 @@ spec:
 func TestInfluxScaler(t *testing.T) {
 	// setup
 	t.Log("--- setting up ---")
-
 	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
 	data, templates := getTemplateData()
+	t.Cleanup(func() {
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
 
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
 	assert.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, influxdbStatefulsetName, testNamespace, 1, 60, 1),
 		"replica count should be 0 after a minute")
 
+	// get token
+	updateDataWithInfluxAuth(t, kc, &data)
+
 	// test activation
-	testActivation(t, kc)
+	testActivation(t, kc, data)
 	// test scaling
-	testScaleFloat(t, kc)
+	testScaleFloat(t, kc, data)
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
 }
 
-func runWriteJob(t *testing.T, kc *kubernetes.Clientset) templateData {
+func updateDataWithInfluxAuth(t *testing.T, kc *kubernetes.Clientset, data *templateData) {
 	// run writeJob
-	data, _ := getTemplateData()
-	KubectlApplyWithTemplate(t, data, "influxdbWriteJobTemplate", influxdbWriteJobTemplate)
-	assert.True(t, WaitForJobSuccess(t, kc, influxdbJobName, testNamespace, 30, 2), "Job should run successfully")
+	KubectlReplaceWithTemplate(t, data, "influxdbWriteJobTemplate", influxdbWriteJobTemplate)
+	require.True(t, WaitForJobSuccess(t, kc, influxdbJobName, testNamespace, 30, 2), "Job should run successfully")
 
 	// get pod logs
-	log := FindPodLogs(t, kc, testNamespace, label)
+	log, err := FindPodLogs(kc, testNamespace, label, false)
+	require.NoErrorf(t, err, "cannotget logs - %s", err)
 
 	var lines []string
 	sc := bufio.NewScanner(strings.NewReader(log[0]))
@@ -221,7 +226,6 @@ func runWriteJob(t *testing.T, kc *kubernetes.Clientset) templateData {
 	}
 	data.AuthToken = (strings.SplitN(lines[0], "=", 2))[1]
 	data.OrgName = (strings.SplitN(lines[1], "=", 2))[1]
-	return data
 }
 
 func getTemplateData() (templateData, []Template) {
@@ -239,17 +243,15 @@ func getTemplateData() (templateData, []Template) {
 		}
 }
 
-func testActivation(t *testing.T, kc *kubernetes.Clientset) {
+func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing activation---")
-	data := runWriteJob(t, kc)
 
 	KubectlApplyWithTemplate(t, data, "scaledObjectActivationTemplate", scaledObjectActivationTemplate)
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, 0, 30)
 }
 
-func testScaleFloat(t *testing.T, kc *kubernetes.Clientset) {
+func testScaleFloat(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale out float---")
-	data := runWriteJob(t, kc)
 
 	KubectlApplyWithTemplate(t, data, "scaledObjectTemplateFloat", scaledObjectTemplateFloat)
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 2, 60, 1),

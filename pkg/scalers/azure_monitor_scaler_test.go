@@ -23,6 +23,7 @@ import (
 	"github.com/go-logr/logr"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 const (
@@ -39,7 +40,7 @@ type parseAzMonitorMetadataTestData struct {
 
 type azMonitorMetricIdentifier struct {
 	metadataTestData *parseAzMonitorMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -83,8 +84,6 @@ var testParseAzMonitorMetadata = []parseAzMonitorMetadataTestData{
 	{map[string]string{"resourceURI": "test/resource/uri", "tenantId": "123", "subscriptionId": "456", "resourceGroupName": "test", "metricName": "metric", "metricAggregationInterval": "0:15:0", "metricAggregationType": "Average", "activeDirectoryClientId": "CLIENT_ID", "activeDirectoryClientPasswordFromEnv": "CLIENT_PASSWORD", "targetValue": "5", "activationTargetValue": "A"}, true, testAzMonitorResolvedEnv, map[string]string{}, ""},
 	// connection from authParams
 	{map[string]string{"resourceURI": "test/resource/uri", "tenantId": "123", "subscriptionId": "456", "resourceGroupName": "test", "metricName": "metric", "metricAggregationInterval": "0:15:0", "metricAggregationType": "Average", "targetValue": "5"}, false, map[string]string{}, map[string]string{"activeDirectoryClientId": "zzz", "activeDirectoryClientPassword": "password"}, ""},
-	// connection with podIdentity
-	{map[string]string{"resourceURI": "test/resource/uri", "tenantId": "123", "subscriptionId": "456", "resourceGroupName": "test", "metricName": "metric", "metricAggregationInterval": "0:15:0", "metricAggregationType": "Average", "targetValue": "5"}, false, map[string]string{}, map[string]string{}, kedav1alpha1.PodIdentityProviderAzure},
 	// wrong podIdentity
 	{map[string]string{"resourceURI": "test/resource/uri", "tenantId": "123", "subscriptionId": "456", "resourceGroupName": "test", "metricName": "metric", "metricAggregationInterval": "0:15:0", "metricAggregationType": "Average", "targetValue": "5"}, true, map[string]string{}, map[string]string{}, kedav1alpha1.PodIdentityProvider("notAzure")},
 	// connection with workload Identity
@@ -95,13 +94,7 @@ var testParseAzMonitorMetadata = []parseAzMonitorMetadataTestData{
 	{map[string]string{"resourceURI": "test/resource/uri", "tenantId": "123", "subscriptionId": "456", "resourceGroupName": "test", "metricName": "metric", "metricAggregationInterval": "0:15:0", "metricAggregationType": "Average", "activeDirectoryClientId": "CLIENT_ID", "activeDirectoryClientPasswordFromEnv": "CLIENT_PASSWORD", "targetValue": "5", "metricNamespace": "namespace", "cloud": "azureChinaCloud"}, false, testAzMonitorResolvedEnv, map[string]string{}, ""},
 	// private cloud
 	{map[string]string{"resourceURI": "test/resource/uri", "tenantId": "123", "subscriptionId": "456", "resourceGroupName": "test", "metricName": "metric", "metricAggregationInterval": "0:15:0", "metricAggregationType": "Average", "activeDirectoryClientId": "CLIENT_ID", "activeDirectoryClientPasswordFromEnv": "CLIENT_PASSWORD", "targetValue": "5", "metricNamespace": "namespace", "cloud": "private",
-		"azureResourceManagerEndpoint": testAzureResourceManagerEndpoint, "activeDirectoryEndpoint": testActiveDirectoryEndpoint}, false, testAzMonitorResolvedEnv, map[string]string{}, ""},
-	// private cloud with missing resource manager endpoint
-	{map[string]string{"resourceURI": "test/resource/uri", "tenantId": "123", "subscriptionId": "456", "resourceGroupName": "test", "metricName": "metric", "metricAggregationInterval": "0:15:0", "metricAggregationType": "Average", "activeDirectoryClientId": "CLIENT_ID", "activeDirectoryClientPasswordFromEnv": "CLIENT_PASSWORD", "targetValue": "5", "metricNamespace": "namespace", "cloud": "private",
-		"activeDirectoryEndpoint": testActiveDirectoryEndpoint}, true, testAzMonitorResolvedEnv, map[string]string{}, ""},
-	// private cloud with missing active directory endpoint
-	{map[string]string{"resourceURI": "test/resource/uri", "tenantId": "123", "subscriptionId": "456", "resourceGroupName": "test", "metricName": "metric", "metricAggregationInterval": "0:15:0", "metricAggregationType": "Average", "activeDirectoryClientId": "CLIENT_ID", "activeDirectoryClientPasswordFromEnv": "CLIENT_PASSWORD", "targetValue": "5", "metricNamespace": "namespace", "cloud": "private",
-		"azureResourceManagerEndpoint": testAzureResourceManagerEndpoint}, true, testAzMonitorResolvedEnv, map[string]string{}, ""},
+		"azureResourceManagerEndpoint": testAzureResourceManagerEndpoint}, false, testAzMonitorResolvedEnv, map[string]string{}, ""},
 }
 
 var azMonitorMetricIdentifiers = []azMonitorMetricIdentifier{
@@ -111,7 +104,7 @@ var azMonitorMetricIdentifiers = []azMonitorMetricIdentifier{
 
 func TestAzMonitorParseMetadata(t *testing.T) {
 	for _, testData := range testParseAzMonitorMetadata {
-		_, err := parseAzureMonitorMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv,
+		_, err := parseAzureMonitorMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv,
 			AuthParams: testData.authParams, PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.podIdentity}}, logr.Discard())
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
@@ -124,13 +117,13 @@ func TestAzMonitorParseMetadata(t *testing.T) {
 
 func TestAzMonitorGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range azMonitorMetricIdentifiers {
-		meta, err := parseAzureMonitorMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata,
+		meta, err := parseAzureMonitorMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata,
 			ResolvedEnv: testData.metadataTestData.resolvedEnv, AuthParams: testData.metadataTestData.authParams,
-			PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.metadataTestData.podIdentity}, ScalerIndex: testData.scalerIndex}, logr.Discard())
+			PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: testData.metadataTestData.podIdentity}, TriggerIndex: testData.triggerIndex}, logr.Discard())
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
-		mockAzMonitorScaler := azureMonitorScaler{"", meta, kedav1alpha1.AuthPodIdentity{Provider: testData.metadataTestData.podIdentity}, logr.Discard()}
+		mockAzMonitorScaler := azureMonitorScaler{"", meta, logr.Discard(), nil}
 
 		metricSpec := mockAzMonitorScaler.GetMetricSpecForScaling(context.Background())
 		metricName := metricSpec[0].External.Metric.Name

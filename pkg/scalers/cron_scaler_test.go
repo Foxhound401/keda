@@ -6,7 +6,10 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type parseCronMetadataTestData struct {
@@ -16,7 +19,7 @@ type parseCronMetadataTestData struct {
 
 type cronMetricIdentifier struct {
 	metadataTestData *parseCronMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -61,7 +64,7 @@ var currentHour = time.Now().In(tz).Hour()
 
 func TestCronParseMetadata(t *testing.T) {
 	for _, testData := range testCronMetadata {
-		_, err := parseCronMetadata(&ScalerConfig{TriggerMetadata: testData.metadata})
+		_, err := parseCronMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata})
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
 		}
@@ -72,7 +75,7 @@ func TestCronParseMetadata(t *testing.T) {
 }
 
 func TestIsActive(t *testing.T) {
-	scaler, _ := NewCronScaler(&ScalerConfig{TriggerMetadata: validCronMetadata})
+	scaler, _ := NewCronScaler(&scalersconfig.ScalerConfig{TriggerMetadata: validCronMetadata})
 	_, isActive, _ := scaler.GetMetricsAndActivity(context.TODO(), "ReplicaCount")
 	if currentDay == "Thursday" {
 		assert.Equal(t, isActive, true)
@@ -82,7 +85,7 @@ func TestIsActive(t *testing.T) {
 }
 
 func TestIsActiveRange(t *testing.T) {
-	scaler, _ := NewCronScaler(&ScalerConfig{TriggerMetadata: validCronMetadata2})
+	scaler, _ := NewCronScaler(&scalersconfig.ScalerConfig{TriggerMetadata: validCronMetadata2})
 	_, isActive, _ := scaler.GetMetricsAndActivity(context.TODO(), "ReplicaCount")
 	if currentHour%2 == 0 {
 		assert.Equal(t, isActive, true)
@@ -92,7 +95,7 @@ func TestIsActiveRange(t *testing.T) {
 }
 
 func TestGetMetrics(t *testing.T) {
-	scaler, _ := NewCronScaler(&ScalerConfig{TriggerMetadata: validCronMetadata})
+	scaler, _ := NewCronScaler(&scalersconfig.ScalerConfig{TriggerMetadata: validCronMetadata})
 	metrics, _, _ := scaler.GetMetricsAndActivity(context.TODO(), "ReplicaCount")
 	assert.Equal(t, metrics[0].MetricName, "ReplicaCount")
 	if currentDay == "Thursday" {
@@ -103,7 +106,7 @@ func TestGetMetrics(t *testing.T) {
 }
 
 func TestGetMetricsRange(t *testing.T) {
-	scaler, _ := NewCronScaler(&ScalerConfig{TriggerMetadata: validCronMetadata2})
+	scaler, _ := NewCronScaler(&scalersconfig.ScalerConfig{TriggerMetadata: validCronMetadata2})
 	metrics, _, _ := scaler.GetMetricsAndActivity(context.TODO(), "ReplicaCount")
 	assert.Equal(t, metrics[0].MetricName, "ReplicaCount")
 	if currentHour%2 == 0 {
@@ -115,11 +118,22 @@ func TestGetMetricsRange(t *testing.T) {
 
 func TestCronGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range cronMetricIdentifiers {
-		meta, err := parseCronMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ScalerIndex: testData.scalerIndex})
+		meta, err := parseCronMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, TriggerIndex: testData.triggerIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
-		mockCronScaler := cronScaler{"", meta, logr.Discard()}
+
+		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		startSchedule, _ := parser.Parse(meta.Start)
+		endSchedule, _ := parser.Parse(meta.End)
+
+		mockCronScaler := cronScaler{
+			metricType:    "",
+			metadata:      meta,
+			logger:        logr.Discard(),
+			startSchedule: startSchedule,
+			endSchedule:   endSchedule,
+		}
 
 		metricSpec := mockCronScaler.GetMetricSpecForScaling(context.Background())
 		metricName := metricSpec[0].External.Metric.Name

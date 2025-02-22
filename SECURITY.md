@@ -1,22 +1,10 @@
 # Security Policy
 
-## Supported Versions
-
-KEDA commits to supporting the n-2 version minor version of the current major release; as well as the last minor version of the previous major release.
-
-Here's an overview:
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 2.0.x   | :white_check_mark: |
-| 1.5.x   | :white_check_mark: |
-| < 1.5   | :x:                |
-
 ## Prevention
 
 We have a few preventive measures in place to detect security vulnerabilities:
 
-- [Renovate](https://renovatebot.com) helps us keep our dependencies up-to-date to patch vulnerabilities as soon as possible.
+- [Renovate](https://renovatebot.com) & [Dependabot](https://docs.github.com/en/code-security/dependabot/dependabot-security-updates/about-dependabot-security-updates) help us keep our dependencies up-to-date to patch vulnerabilities as soon as possible by creating awareness and automated PRs.
 - [Snyk](https://snyk.io/) helps us ship secure container images:
   - Images are scanned in every pull request (PR) to detect new vulnerabilities.
   - Published images on GitHub Container Registry are monitored to detect new vulnerabilities so we can ship patches
@@ -26,6 +14,8 @@ We have a few preventive measures in place to detect security vulnerabilities:
 - [GitHub's security features](https://github.com/features/security) are constantly monitoring our repo and dependencies:
   - All pull requests (PRs) are using CodeQL to scan our source code for vulnerabilities
   - Dependabot will automatically identify vulnerabilities based on GitHub Advisory Database and open PRs with patches
+  - Automated [secret scanning](https://docs.github.com/en/enterprise-cloud@latest/code-security/secret-scanning/about-secret-scanning#about-secret-scanning-for-partner-patterns) & alerts
+- The [Scorecard GitHub Action](https://github.com/ossf/scorecard-action) automates the process by running security checks on the GitHub repository. By integrating this Action into the repository's workflow, we can continuously monitor the project’s security posture. The Scorecard checks cover various security best practices and provide scores for multiple categories. Some checks include Code Reviews, Branch Protection, Signed Releases, etc.
 
 KEDA maintainers are working to improve our prevention by adding additional measures:
 
