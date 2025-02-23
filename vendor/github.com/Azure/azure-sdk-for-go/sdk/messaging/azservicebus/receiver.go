@@ -11,12 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/internal/log"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/amqpwrap"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/exported"
-	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/go-amqp"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/utils"
+	"github.com/Azure/go-amqp"
 )
 
 // ReceiveMode represents the lock style to use for a receiver - either
@@ -45,22 +44,17 @@ const (
 
 // Receiver receives messages using pull based functions (ReceiveMessages).
 type Receiver struct {
-	receiveMode ReceiveMode
-	entityPath  string
-
-	settler        settler
-	retryOptions   RetryOptions
-	cleanupOnClose func()
-
-	lastPeekedSequenceNumber int64
 	amqpLinks                internal.AMQPLinks
-
-	mu        sync.Mutex
-	receiving bool
-
-	defaultTimeAfterFirstMsg time.Duration
-
-	cancelReleaser *atomic.Value
+	cancelReleaser           *atomic.Value
+	cleanupOnClose           func()
+	entityPath               string
+	lastPeekedSequenceNumber int64
+	maxAllowedCredits        uint32
+	mu                       sync.Mutex
+	receiveMode              ReceiveMode
+	receiving                bool
+	retryOptions             RetryOptions
+	settler                  *messageSettler
 }
 
 // ReceiverOptions contains options for the `Client.NewReceiverForQueue` or `Client.NewReceiverForSubscription`
@@ -85,7 +79,10 @@ type ReceiverOptions struct {
 	SubQueue SubQueue
 }
 
-const defaultLinkRxBuffer = 2048
+// defaultLinkRxBuffer is the maximum number of transfer frames we can handle
+// on the Receiver. This matches the current default window size that go-amqp
+// uses for sessions.
+const defaultLinkRxBuffer uint32 = 5000
 
 func applyReceiverOptions(receiver *Receiver, entity *entity, options *ReceiverOptions) error {
 	if options == nil {
@@ -113,11 +110,11 @@ func applyReceiverOptions(receiver *Receiver, entity *entity, options *ReceiverO
 }
 
 type newReceiverArgs struct {
-	ns                  internal.NamespaceWithNewAMQPLinks
+	ns                  internal.NamespaceForAMQPLinks
 	entity              entity
 	cleanupOnClose      func()
 	getRecoveryKindFunc func(err error) internal.RecoveryKind
-	newLinkFn           func(ctx context.Context, session amqpwrap.AMQPSession) (internal.AMQPSenderCloser, internal.AMQPReceiverCloser, error)
+	newLinkFn           func(ctx context.Context, session amqpwrap.AMQPSession) (amqpwrap.AMQPSenderCloser, amqpwrap.AMQPReceiverCloser, error)
 	retryOptions        RetryOptions
 }
 
@@ -131,11 +128,11 @@ func newReceiver(args newReceiverArgs, options *ReceiverOptions) (*Receiver, err
 	}
 
 	receiver := &Receiver{
-		lastPeekedSequenceNumber: 0,
-		cleanupOnClose:           args.cleanupOnClose,
-		defaultTimeAfterFirstMsg: 20 * time.Millisecond,
-		retryOptions:             args.retryOptions,
 		cancelReleaser:           &atomic.Value{},
+		cleanupOnClose:           args.cleanupOnClose,
+		lastPeekedSequenceNumber: 0,
+		maxAllowedCredits:        defaultLinkRxBuffer,
+		retryOptions:             args.retryOptions,
 	}
 
 	receiver.cancelReleaser.Store(emptyCancelFn)
@@ -144,20 +141,18 @@ func newReceiver(args newReceiverArgs, options *ReceiverOptions) (*Receiver, err
 		return nil, err
 	}
 
-	if receiver.receiveMode == ReceiveModeReceiveAndDelete {
-		// TODO: there appears to be a bit more overhead when receiving messages
-		// in ReceiveAndDelete. Need to investigate if this is related to our
-		// auto-accepting logic in go-amqp.
-		receiver.defaultTimeAfterFirstMsg = time.Second
-	}
-
 	newLinkFn := receiver.newReceiverLink
 
 	if args.newLinkFn != nil {
 		newLinkFn = args.newLinkFn
 	}
 
-	receiver.amqpLinks = args.ns.NewAMQPLinks(receiver.entityPath, newLinkFn, args.getRecoveryKindFunc)
+	receiver.amqpLinks = internal.NewAMQPLinks(internal.NewAMQPLinksArgs{
+		NS:                  args.ns,
+		EntityPath:          receiver.entityPath,
+		CreateLinkFunc:      newLinkFn,
+		GetRecoveryKindFunc: args.getRecoveryKindFunc,
+	})
 
 	// 'nil' settler handles returning an error message for receiveAndDelete links.
 	if receiver.receiveMode == ReceiveModePeekLock {
@@ -169,7 +164,7 @@ func newReceiver(args newReceiverArgs, options *ReceiverOptions) (*Receiver, err
 	return receiver, nil
 }
 
-func (r *Receiver) newReceiverLink(ctx context.Context, session amqpwrap.AMQPSession) (internal.AMQPSenderCloser, internal.AMQPReceiverCloser, error) {
+func (r *Receiver) newReceiverLink(ctx context.Context, session amqpwrap.AMQPSession) (amqpwrap.AMQPSenderCloser, amqpwrap.AMQPReceiverCloser, error) {
 	linkOptions := createLinkOptions(r.receiveMode)
 	link, err := session.NewReceiver(ctx, r.entityPath, linkOptions)
 	return nil, link, err
@@ -177,12 +172,18 @@ func (r *Receiver) newReceiverLink(ctx context.Context, session amqpwrap.AMQPSes
 
 // ReceiveMessagesOptions are options for the ReceiveMessages function.
 type ReceiveMessagesOptions struct {
-	// For future expansion
+	// TimeAfterFirstMessage controls how long, after a message has been received, before we return the
+	// accumulated batch of messages.
+	//
+	// Default value depends on the receive mode:
+	// - 20ms when the receiver is in ReceiveModePeekLock
+	// - 1s when the receiver is in ReceiveModeReceiveAndDelete
+	TimeAfterFirstMessage time.Duration
 }
 
 // ReceiveMessages receives a fixed number of messages, up to numMessages.
 // This function will block until at least one message is received or until the ctx is cancelled.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (r *Receiver) ReceiveMessages(ctx context.Context, maxMessages int, options *ReceiveMessagesOptions) ([]*ReceivedMessage, error) {
 	r.mu.Lock()
 	isReceiving := r.receiving
@@ -212,7 +213,7 @@ type ReceiveDeferredMessagesOptions struct {
 }
 
 // ReceiveDeferredMessages receives messages that were deferred using `Receiver.DeferMessage`.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (r *Receiver) ReceiveDeferredMessages(ctx context.Context, sequenceNumbers []int64, options *ReceiveDeferredMessagesOptions) ([]*ReceivedMessage, error) {
 	var receivedMessages []*ReceivedMessage
 
@@ -224,8 +225,8 @@ func (r *Receiver) ReceiveDeferredMessages(ctx context.Context, sequenceNumbers 
 		}
 
 		for _, amqpMsg := range amqpMessages {
-			receivedMsg := newReceivedMessage(amqpMsg)
-			receivedMsg.deferred = true
+			receivedMsg := newReceivedMessage(amqpMsg, lwid.Receiver)
+			receivedMsg.settleOnMgmtLink = true
 
 			receivedMessages = append(receivedMessages, receivedMsg)
 		}
@@ -247,12 +248,14 @@ type PeekMessagesOptions struct {
 //
 // The Receiver stores the last peeked sequence number internally, and will use it as the
 // start location for the next PeekMessages() call. You can override this behavior by passing an
-// explicit sequence number in PeekMessagesOptions.FromSequenceNumber.
+// explicit sequence number in [azservicebus.PeekMessagesOptions.FromSequenceNumber].
 //
-// Messages that are peeked do not have lock tokens, so settlement methods
-// like CompleteMessage, AbandonMessage, DeferMessage or DeadLetterMessage
-// will not work with them.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// Messages that are peeked are not locked, so settlement methods like [Receiver.CompleteMessage],
+// [Receiver.AbandonMessage], [Receiver.DeferMessage] or [Receiver.DeadLetterMessage] will not work with them.
+//
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
+//
+// For more information about peeking/message-browsing see https://aka.ms/azsdk/servicebus/message-browsing
 func (r *Receiver) PeekMessages(ctx context.Context, maxMessageCount int, options *PeekMessagesOptions) ([]*ReceivedMessage, error) {
 	var receivedMessages []*ReceivedMessage
 
@@ -274,7 +277,7 @@ func (r *Receiver) PeekMessages(ctx context.Context, maxMessageCount int, option
 		receivedMessages = make([]*ReceivedMessage, len(messages))
 
 		for i := 0; i < len(messages); i++ {
-			receivedMessages[i] = newReceivedMessage(messages[i])
+			receivedMessages[i] = newReceivedMessage(messages[i], links.Receiver)
 		}
 
 		if len(receivedMessages) > 0 && updateInternalSequenceNumber {
@@ -294,10 +297,10 @@ type RenewMessageLockOptions struct {
 }
 
 // RenewMessageLock renews the lock on a message, updating the `LockedUntil` field on `msg`.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (r *Receiver) RenewMessageLock(ctx context.Context, msg *ReceivedMessage, options *RenewMessageLockOptions) error {
 	err := r.amqpLinks.Retry(ctx, EventReceiver, "renewMessageLock", func(ctx context.Context, linksWithVersion *internal.LinksWithID, args *utils.RetryFnArgs) error {
-		newExpirationTime, err := internal.RenewLocks(ctx, linksWithVersion.RPC, msg.RawAMQPMessage.linkName, []amqp.UUID{
+		newExpirationTime, err := internal.RenewLocks(ctx, linksWithVersion.RPC, msg.linkName, []amqp.UUID{
 			(amqp.UUID)(msg.LockToken),
 		})
 
@@ -316,7 +319,7 @@ func (r *Receiver) RenewMessageLock(ctx context.Context, msg *ReceivedMessage, o
 func (r *Receiver) Close(ctx context.Context) error {
 	cancelReleaser := r.cancelReleaser.Swap(emptyCancelFn).(func() string)
 	releaserID := cancelReleaser()
-	log.Writef(EventReceiver, "Stopped message releaser with ID '%s'", releaserID)
+	r.amqpLinks.Writef(EventReceiver, "Stopped message releaser with ID '%s'", releaserID)
 
 	r.cleanupOnClose()
 	return r.amqpLinks.Close(ctx, true)
@@ -324,16 +327,16 @@ func (r *Receiver) Close(ctx context.Context) error {
 
 // CompleteMessage completes a message, deleting it from the queue or subscription.
 // This function can only be used when the Receiver has been opened with ReceiveModePeekLock.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (r *Receiver) CompleteMessage(ctx context.Context, message *ReceivedMessage, options *CompleteMessageOptions) error {
 	return r.settler.CompleteMessage(ctx, message, options)
 }
 
-// AbandonMessage will cause a message to be  available again from the queue or subscription.
+// AbandonMessage will cause a message to be available again from the queue or subscription.
 // This will increment its delivery count, and potentially cause it to be dead-lettered
 // depending on your queue or subscription's configuration.
 // This function can only be used when the Receiver has been opened with `ReceiveModePeekLock`.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (r *Receiver) AbandonMessage(ctx context.Context, message *ReceivedMessage, options *AbandonMessageOptions) error {
 	return r.settler.AbandonMessage(ctx, message, options)
 }
@@ -341,7 +344,7 @@ func (r *Receiver) AbandonMessage(ctx context.Context, message *ReceivedMessage,
 // DeferMessage will cause a message to be deferred. Deferred messages can be received using
 // `Receiver.ReceiveDeferredMessages`.
 // This function can only be used when the Receiver has been opened with `ReceiveModePeekLock`.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (r *Receiver) DeferMessage(ctx context.Context, message *ReceivedMessage, options *DeferMessageOptions) error {
 	return r.settler.DeferMessage(ctx, message, options)
 }
@@ -350,7 +353,7 @@ func (r *Receiver) DeferMessage(ctx context.Context, message *ReceivedMessage, o
 // queue or subscription. To receive these messages create a receiver with `Client.NewReceiverForQueue()`
 // or `Client.NewReceiverForSubscription()` using the `ReceiverOptions.SubQueue` option.
 // This function can only be used when the Receiver has been opened with `ReceiveModePeekLock`.
-// If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
+// If the operation fails it can return an [*azservicebus.Error] type if the failure is actionable.
 func (r *Receiver) DeadLetterMessage(ctx context.Context, message *ReceivedMessage, options *DeadLetterOptions) error {
 	return r.settler.DeadLetterMessage(ctx, message, options)
 }
@@ -358,6 +361,14 @@ func (r *Receiver) DeadLetterMessage(ctx context.Context, message *ReceivedMessa
 func (r *Receiver) receiveMessagesImpl(ctx context.Context, maxMessages int, options *ReceiveMessagesOptions) ([]*ReceivedMessage, error) {
 	cancelReleaser := r.cancelReleaser.Swap(emptyCancelFn).(func() string)
 	_ = cancelReleaser()
+
+	if maxMessages <= 0 {
+		return nil, internal.NewErrNonRetriable("maxMessages should be greater than 0")
+	}
+
+	if maxMessages > int(r.maxAllowedCredits) {
+		return nil, internal.NewErrNonRetriable(fmt.Sprintf("maxMessages cannot exceed %d", r.maxAllowedCredits))
+	}
 
 	var linksWithID *internal.LinksWithID
 
@@ -375,21 +386,28 @@ func (r *Receiver) receiveMessagesImpl(ctx context.Context, maxMessages int, opt
 	// might have exited before all credits were used up.
 	currentReceiverCredits := int64(linksWithID.Receiver.Credits())
 	creditsToIssue := int64(maxMessages) - currentReceiverCredits
-	log.Writef(EventReceiver, "Asking for %d credits", maxMessages)
 
 	if creditsToIssue > 0 {
-		log.Writef(EventReceiver, "Only need to issue %d additional credits", creditsToIssue)
+		r.amqpLinks.Writef(EventReceiver, "Issuing %d credits, have %d", creditsToIssue, currentReceiverCredits)
 
 		if err := linksWithID.Receiver.IssueCredit(uint32(creditsToIssue)); err != nil {
 			return nil, err
 		}
 	} else {
-		log.Writef(EventReceiver, "No additional credits needed, still have %d credits active", currentReceiverCredits)
+		r.amqpLinks.Writef(EventReceiver, "Have %d credits, no new credits needed", currentReceiverCredits)
 	}
 
-	result := r.fetchMessages(ctx, linksWithID.Receiver, maxMessages, r.defaultTimeAfterFirstMsg)
+	timeAfterFirstMessage := 20 * time.Millisecond
 
-	log.Writef(EventReceiver, "Received %d/%d messages", len(result.Messages), maxMessages)
+	if options != nil && options.TimeAfterFirstMessage > 0 {
+		timeAfterFirstMessage = options.TimeAfterFirstMessage
+	} else if r.receiveMode == ReceiveModeReceiveAndDelete {
+		timeAfterFirstMessage = time.Second
+	}
+
+	result := r.fetchMessages(ctx, linksWithID.Receiver, maxMessages, timeAfterFirstMessage)
+
+	r.amqpLinks.Writef(EventReceiver, "Received %d/%d messages", len(result.Messages), maxMessages)
 
 	// this'll only close anything if the error indicates that the link/connection is bad.
 	// it's safe to call with cancellation errors.
@@ -404,7 +422,7 @@ func (r *Receiver) receiveMessagesImpl(ctx context.Context, maxMessages int, opt
 		releaserFunc := r.newReleaserFunc(linksWithID.Receiver)
 		go releaserFunc()
 	} else {
-		log.Writef(EventReceiver, "Failure when receiving messages: %s", result.Error)
+		r.amqpLinks.Writef(EventReceiver, "Failure when receiving messages: %s", result.Error)
 	}
 
 	// If the user does get some messages we ignore 'error' and return only the messages.
@@ -427,7 +445,7 @@ func (r *Receiver) receiveMessagesImpl(ctx context.Context, maxMessages int, opt
 	var receivedMessages []*ReceivedMessage
 
 	for _, msg := range result.Messages {
-		receivedMessages = append(receivedMessages, newReceivedMessage(msg))
+		receivedMessages = append(receivedMessages, newReceivedMessage(msg, linksWithID.Receiver))
 	}
 
 	return receivedMessages, nil
@@ -472,20 +490,19 @@ func (e *entity) SetSubQueue(subQueue SubQueue) error {
 }
 
 func createLinkOptions(mode ReceiveMode) *amqp.ReceiverOptions {
-	receiveMode := amqp.ModeSecond
+	receiveMode := amqp.ReceiverSettleModeSecond
 
 	if mode == ReceiveModeReceiveAndDelete {
-		receiveMode = amqp.ModeFirst
+		receiveMode = amqp.ReceiverSettleModeFirst
 	}
 
 	receiverOpts := &amqp.ReceiverOptions{
 		SettlementMode: receiveMode.Ptr(),
-		ManualCredits:  true,
-		Credit:         defaultLinkRxBuffer,
+		Credit:         -1,
 	}
 
 	if mode == ReceiveModeReceiveAndDelete {
-		receiverOpts.RequestedSenderSettleMode = amqp.ModeSettled.Ptr()
+		receiverOpts.RequestedSenderSettleMode = amqp.SenderSettleModeSettled.Ptr()
 	}
 
 	return receiverOpts
@@ -518,7 +535,7 @@ func (r *Receiver) fetchMessages(parentCtx context.Context, receiver amqpwrap.AM
 	// so the user doesn't end up in a situation where we're holding onto a bunch
 	// of messages but never return because they never cancelled and we never
 	// received all 'count' number of messages.
-	firstMsg, err := receiver.Receive(parentCtx)
+	firstMsg, err := receiver.Receive(parentCtx, nil)
 
 	if err != nil {
 		// drain the prefetch buffer - we're stopping because of a
@@ -546,7 +563,7 @@ func (r *Receiver) fetchMessages(parentCtx context.Context, receiver amqpwrap.AM
 	var lastErr error
 
 	for i := 0; i < count-1; i++ {
-		msg, err := receiver.Receive(ctx)
+		msg, err := receiver.Receive(ctx, nil)
 
 		if err != nil {
 			lastErr = err
@@ -604,11 +621,9 @@ func (r *Receiver) newReleaserFunc(receiver amqpwrap.AMQPReceiver) func() {
 	return func() {
 		defer close(done)
 
-		log.Writef(EventReceiver, "[%s] Message releaser starting...", receiver.LinkName())
-
 		for {
 			// we might not have all the messages we need here.
-			msg, err := receiver.Receive(ctx)
+			msg, err := receiver.Receive(ctx, nil)
 
 			if err == nil {
 				err = receiver.ReleaseMessage(ctx, msg)
@@ -619,10 +634,12 @@ func (r *Receiver) newReleaserFunc(receiver amqpwrap.AMQPReceiver) func() {
 			}
 
 			if internal.IsCancelError(err) {
-				log.Writef(exported.EventReceiver, "[%s] Message releaser pausing. Released %d messages", receiver.LinkName(), released)
+				if released > 0 {
+					r.amqpLinks.Writef(exported.EventReceiver, "Message releaser pausing. Released %d messages", released)
+				}
 				break
 			} else if internal.GetRecoveryKind(err) != internal.RecoveryKindNone {
-				log.Writef(exported.EventReceiver, "[%s] Message releaser stopping because of link failure. Released %d messages. Will start again after next receive: %s", receiver.LinkName(), released, err)
+				r.amqpLinks.Writef(exported.EventReceiver, "Message releaser stopping because of link failure. Released %d messages. Will start again after next receive: %s", released, err)
 				break
 			}
 		}

@@ -1,7 +1,7 @@
 //go:build e2e
 // +build e2e
 
-package azure_service_bus_queue_aad_pod_identity_test
+package azure_service_bus_queue_wi_test
 
 import (
 	"context"
@@ -32,7 +32,7 @@ var (
 	deploymentName   = fmt.Sprintf("%s-deployment", testName)
 	triggerAuthName  = fmt.Sprintf("%s-ta", testName)
 	scaledObjectName = fmt.Sprintf("%s-so", testName)
-	queueName        = fmt.Sprintf("%s-queue", testName)
+	queueName        = fmt.Sprintf("queue-%d", GetRandomNumber())
 )
 
 type templateData struct {
@@ -63,7 +63,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: nginx:1.16.1
+          image: nginxinc/nginx-unprivileged
 `
 
 	triggerAuthTemplate = `
@@ -123,7 +123,7 @@ func TestScaler(t *testing.T) {
 	testScaleIn(t, kc, adminClient)
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 	cleanupServiceBusQueue(t, adminClient)
 }
 

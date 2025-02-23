@@ -58,7 +58,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: 'nginx'
+          image: 'nginxinc/nginx-unprivileged'
 `
 
 	scaledObjectTemplate = `
@@ -107,7 +107,7 @@ func TestScaler(t *testing.T) {
 	testScaleIn(t, kc)
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 }
 
 func getTemplateData() (templateData, []Template) {

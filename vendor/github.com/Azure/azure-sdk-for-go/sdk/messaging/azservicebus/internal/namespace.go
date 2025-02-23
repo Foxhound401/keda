@@ -14,18 +14,18 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/internal/log"
+	"github.com/Azure/azure-sdk-for-go/sdk/internal/telemetry"
+	"github.com/Azure/azure-sdk-for-go/sdk/internal/uuid"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/amqpwrap"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/auth"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/conn"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/exported"
-	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/go-amqp"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/sbauth"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/utils"
+	"github.com/Azure/go-amqp"
 )
 
-const (
-	rootUserAgent = "/azsdk-go-azservicebus/" + Version
-)
+var rootUserAgent = telemetry.Format("azservicebus", Version)
 
 type (
 	// Namespace is an abstraction over an amqp.Client, allowing us to hold onto a single
@@ -63,35 +63,40 @@ type (
 	NamespaceOption func(h *Namespace) error
 )
 
-// NamespaceWithNewAMQPLinks is the Namespace surface for consumers of AMQPLinks.
-type NamespaceWithNewAMQPLinks interface {
-	NewAMQPLinks(entityPath string, createLinkFunc CreateLinkFunc, getRecoveryKindFunc func(err error) RecoveryKind) AMQPLinks
-	Check() error
-}
-
 // NamespaceForAMQPLinks is the Namespace surface needed for the internals of AMQPLinks.
 type NamespaceForAMQPLinks interface {
+	Check() error
 	NegotiateClaim(ctx context.Context, entityPath string) (context.CancelFunc, <-chan struct{}, error)
 	NewAMQPSession(ctx context.Context) (amqpwrap.AMQPSession, uint64, error)
-	NewRPCLink(ctx context.Context, managementPath string) (RPCLink, error)
+	NewRPCLink(ctx context.Context, managementPath string) (amqpwrap.RPCLink, error)
 	GetEntityAudience(entityPath string) string
+
+	// Recover destroys the currently held AMQP connection and recreates it, if needed.
+	//
+	// If a new client is actually created (rather than just cached) then the returned bool
+	// will be true. Any links that were created from the original connection will need to
+	// be recreated.
+	//
+	// NOTE: cancelling the context only cancels the initialization of a new AMQP
+	// connection - the previous connection is always closed.
 	Recover(ctx context.Context, clientRevision uint64) (bool, error)
-	Close(ctx context.Context, permanently bool) error
+
+	Close(permanently bool) error
 }
 
 // NamespaceWithConnectionString configures a namespace with the information provided in a Service Bus connection string
 func NamespaceWithConnectionString(connStr string) NamespaceOption {
 	return func(ns *Namespace) error {
-		parsed, err := conn.ParsedConnectionFromStr(connStr)
+		props, err := conn.ParseConnectionString(connStr)
 		if err != nil {
 			return err
 		}
 
-		if parsed.Namespace != "" {
-			ns.FQDN = parsed.Namespace
+		if props.FullyQualifiedNamespace != "" {
+			ns.FQDN = props.FullyQualifiedNamespace
 		}
 
-		provider, err := sbauth.NewTokenProviderWithConnectionString(parsed)
+		provider, err := sbauth.NewTokenProviderWithConnectionString(props)
 		if err != nil {
 			return err
 		}
@@ -142,10 +147,17 @@ func NamespaceWithRetryOptions(retryOptions exported.RetryOptions) NamespaceOpti
 	}
 }
 
+// NamespaceWithNewClientFn lets you inject a construction function to create new AMQP clients. Useful for tests.
+func NamespaceWithNewClientFn(fn func(ctx context.Context) (amqpwrap.AMQPClient, error)) NamespaceOption {
+	return func(ns *Namespace) error {
+		ns.newClientFn = fn
+		return nil
+	}
+}
+
 // NewNamespace creates a new namespace configured through NamespaceOption(s)
 func NewNamespace(opts ...NamespaceOption) (*Namespace, error) {
 	ns := &Namespace{}
-
 	ns.newClientFn = ns.newClientImpl
 
 	for _, opt := range opts {
@@ -162,7 +174,7 @@ func (ns *Namespace) newClientImpl(ctx context.Context) (amqpwrap.AMQPClient, er
 	connOptions := amqp.ConnOptions{
 		SASLType:    amqp.SASLTypeAnonymous(),
 		MaxSessions: 65535,
-		Properties: map[string]interface{}{
+		Properties: map[string]any{
 			"product":    "MSGolangClient",
 			"version":    Version,
 			"platform":   runtime.GOOS,
@@ -175,6 +187,12 @@ func (ns *Namespace) newClientImpl(ctx context.Context) (amqpwrap.AMQPClient, er
 		connOptions.TLSConfig = ns.tlsConfig
 	}
 
+	id, err := uuid.New()
+
+	if err != nil {
+		return nil, err
+	}
+
 	if ns.newWebSocketConn != nil {
 		nConn, err := ns.newWebSocketConn(ctx, exported.NewWebSocketConnArgs{
 			Host: ns.getWSSHostURI() + "$servicebus/websocket",
@@ -185,12 +203,13 @@ func (ns *Namespace) newClientImpl(ctx context.Context) (amqpwrap.AMQPClient, er
 		}
 
 		connOptions.HostName = ns.FQDN
-		client, err := amqp.New(nConn, &connOptions)
-		return &amqpwrap.AMQPClientWrapper{Inner: client}, err
+		client, err := amqp.NewConn(ctx, nConn, &connOptions)
+
+		return &amqpwrap.AMQPClientWrapper{Inner: client, ID: id.String()}, err
 	}
 
-	client, err := amqp.Dial(ns.getAMQPHostURI(), &connOptions)
-	return &amqpwrap.AMQPClientWrapper{Inner: client}, err
+	client, err := amqp.Dial(ctx, ns.getAMQPHostURI(), &connOptions)
+	return &amqpwrap.AMQPClientWrapper{Inner: client, ID: id.String()}, err
 }
 
 // NewAMQPSession creates a new AMQP session with the internally cached *amqp.Client.
@@ -212,7 +231,7 @@ func (ns *Namespace) NewAMQPSession(ctx context.Context) (amqpwrap.AMQPSession, 
 }
 
 // NewRPCLink creates a new amqp-common *rpc.Link with the internally cached *amqp.Client.
-func (ns *Namespace) NewRPCLink(ctx context.Context, managementPath string) (RPCLink, error) {
+func (ns *Namespace) NewRPCLink(ctx context.Context, managementPath string) (amqpwrap.RPCLink, error) {
 	client, _, err := ns.GetAMQPClientImpl(ctx)
 
 	if err != nil {
@@ -226,19 +245,8 @@ func (ns *Namespace) NewRPCLink(ctx context.Context, managementPath string) (RPC
 	})
 }
 
-// NewAMQPLinks creates an AMQPLinks struct, which groups together the commonly needed links for
-// working with Service Bus.
-func (ns *Namespace) NewAMQPLinks(entityPath string, createLinkFunc CreateLinkFunc, getRecoveryKindFunc func(err error) RecoveryKind) AMQPLinks {
-	return NewAMQPLinks(NewAMQPLinksArgs{
-		NS:                  ns,
-		EntityPath:          entityPath,
-		CreateLinkFunc:      createLinkFunc,
-		GetRecoveryKindFunc: getRecoveryKindFunc,
-	})
-}
-
 // Close closes the current cached client.
-func (ns *Namespace) Close(ctx context.Context, permanently bool) error {
+func (ns *Namespace) Close(permanently bool) error {
 	ns.clientMu.Lock()
 	defer ns.clientMu.Unlock()
 
@@ -249,7 +257,10 @@ func (ns *Namespace) Close(ctx context.Context, permanently bool) error {
 	if ns.client != nil {
 		err := ns.client.Close()
 		ns.client = nil
-		return err
+
+		if err != nil {
+			log.Writef(exported.EventConn, "Failed when closing AMQP connection: %s", err)
+		}
 	}
 
 	return nil
@@ -270,9 +281,13 @@ func (ns *Namespace) Check() error {
 var ErrClientClosed = NewErrNonRetriable("client has been closed by user")
 
 // Recover destroys the currently held AMQP connection and recreates it, if needed.
-// If a new is actually created (rather than just cached) then the returned bool
+//
+// If a new client is actually created (rather than just cached) then the returned bool
 // will be true. Any links that were created from the original connection will need to
 // be recreated.
+//
+// NOTE: cancelling the context only cancels the initialization of a new AMQP
+// connection - the previous connection is always closed.
 func (ns *Namespace) Recover(ctx context.Context, theirConnID uint64) (bool, error) {
 	if err := ns.Check(); err != nil {
 		return false, err
@@ -323,7 +338,7 @@ func (ns *Namespace) NegotiateClaim(ctx context.Context, entityPath string) (con
 // when the background renewal stops or an error.
 func (ns *Namespace) startNegotiateClaimRenewer(ctx context.Context,
 	entityPath string,
-	cbsNegotiateClaim func(ctx context.Context, audience string, conn amqpwrap.AMQPClient, provider auth.TokenProvider) error,
+	cbsNegotiateClaim func(ctx context.Context, audience string, conn amqpwrap.AMQPClient, provider auth.TokenProvider, contextWithTimeoutFn contextWithTimeoutFn) error,
 	nextClaimRefreshDurationFn func(expirationTime time.Time, currentTime time.Time) time.Duration) (func(), <-chan struct{}, error) {
 	audience := ns.GetEntityAudience(entityPath)
 
@@ -349,7 +364,7 @@ func (ns *Namespace) startNegotiateClaimRenewer(ctx context.Context,
 		// The current cbs.NegotiateClaim implementation automatically creates and shuts
 		// down it's own link so we have to guard against that here.
 		ns.negotiateClaimMu.Lock()
-		err = cbsNegotiateClaim(ctx, audience, amqpClient, token)
+		err = cbsNegotiateClaim(ctx, audience, amqpClient, token, context.WithTimeout)
 		ns.negotiateClaimMu.Unlock()
 
 		if err != nil {
@@ -380,6 +395,8 @@ func (ns *Namespace) startNegotiateClaimRenewer(ctx context.Context,
 
 	// connection strings with embedded SAS tokens will return a zero expiration time since they can't be renewed.
 	if expiresOn.IsZero() {
+		log.Writef(exported.EventAuth, "Token does not have an expiration date, no background renewal needed.")
+
 		// cancel everything related to the claims refresh loop.
 		cancelRefreshCtx()
 		close(refreshStoppedCh)
@@ -474,7 +491,11 @@ func (ns *Namespace) getWSSHostURI() string {
 }
 
 func (ns *Namespace) getAMQPHostURI() string {
-	return fmt.Sprintf("amqps://%s/", ns.FQDN)
+	if ns.TokenProvider.InsecureDisableTLS {
+		return fmt.Sprintf("amqp://%s/", ns.FQDN)
+	} else {
+		return fmt.Sprintf("amqps://%s/", ns.FQDN)
+	}
 }
 
 func (ns *Namespace) GetHTTPSHostURI() string {
@@ -488,7 +509,7 @@ func (ns *Namespace) GetEntityAudience(entityPath string) string {
 func (ns *Namespace) getUserAgent() string {
 	userAgent := rootUserAgent
 	if ns.userAgent != "" {
-		userAgent = fmt.Sprintf("%s/%s", userAgent, ns.userAgent)
+		userAgent = fmt.Sprintf("%s %s", ns.userAgent, userAgent)
 	}
 	return userAgent
 }

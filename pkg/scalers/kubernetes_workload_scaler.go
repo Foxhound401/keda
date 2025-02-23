@@ -3,7 +3,6 @@ package scalers
 import (
 	"context"
 	"fmt"
-	"strconv"
 
 	"github.com/go-logr/logr"
 	v2 "k8s.io/api/autoscaling/v2"
@@ -12,21 +11,19 @@ import (
 	"k8s.io/metrics/pkg/apis/external_metrics"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
 type kubernetesWorkloadScaler struct {
 	metricType v2.MetricTargetType
-	metadata   *kubernetesWorkloadMetadata
+	metadata   kubernetesWorkloadMetadata
 	kubeClient client.Client
 	logger     logr.Logger
 }
 
 const (
 	kubernetesWorkloadMetricType = "External"
-	podSelectorKey               = "podSelector"
-	valueKey                     = "value"
-	activationValueKey           = "activationValue"
 )
 
 var phasesCountedAsTerminated = []corev1.PodPhase{
@@ -35,23 +32,34 @@ var phasesCountedAsTerminated = []corev1.PodPhase{
 }
 
 type kubernetesWorkloadMetadata struct {
-	podSelector     labels.Selector
-	namespace       string
-	value           float64
-	activationValue float64
-	scalerIndex     int
+	PodSelector     string  `keda:"name=podSelector,     order=triggerMetadata"`
+	Value           float64 `keda:"name=value,           order=triggerMetadata, default=0"`
+	ActivationValue float64 `keda:"name=activationValue, order=triggerMetadata, default=0"`
+
+	namespace      string
+	triggerIndex   int
+	podSelector    labels.Selector
+	asMetricSource bool
+}
+
+func (m *kubernetesWorkloadMetadata) Validate() error {
+	if m.Value <= 0 && !m.asMetricSource {
+		return fmt.Errorf("value must be a float greater than 0")
+	}
+
+	return nil
 }
 
 // NewKubernetesWorkloadScaler creates a new kubernetesWorkloadScaler
-func NewKubernetesWorkloadScaler(kubeClient client.Client, config *ScalerConfig) (Scaler, error) {
+func NewKubernetesWorkloadScaler(kubeClient client.Client, config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
 	}
 
-	meta, parseErr := parseWorkloadMetadata(config)
-	if parseErr != nil {
-		return nil, fmt.Errorf("error parsing kubernetes workload metadata: %w", parseErr)
+	meta, err := parseKubernetesWorkloadMetadata(config)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing kubernetes workload metadata: %w", err)
 	}
 
 	return &kubernetesWorkloadScaler{
@@ -62,46 +70,38 @@ func NewKubernetesWorkloadScaler(kubeClient client.Client, config *ScalerConfig)
 	}, nil
 }
 
-func parseWorkloadMetadata(config *ScalerConfig) (*kubernetesWorkloadMetadata, error) {
-	meta := &kubernetesWorkloadMetadata{}
-	var err error
+func parseKubernetesWorkloadMetadata(config *scalersconfig.ScalerConfig) (kubernetesWorkloadMetadata, error) {
+	meta := kubernetesWorkloadMetadata{}
 	meta.namespace = config.ScalableObjectNamespace
-	podSelector, err := labels.Parse(config.TriggerMetadata[podSelectorKey])
-	if err != nil || podSelector.String() == "" {
-		return nil, fmt.Errorf("invalid pod selector")
-	}
-	meta.podSelector = podSelector
-	value, err := strconv.ParseFloat(config.TriggerMetadata[valueKey], 64)
-	if err != nil || value == 0 {
-		return nil, fmt.Errorf("value must be a float greater than 0")
-	}
-	meta.value = value
+	meta.triggerIndex = config.TriggerIndex
+	meta.asMetricSource = config.AsMetricSource
 
-	meta.activationValue = 0
-	if val, ok := config.TriggerMetadata[activationValueKey]; ok {
-		activationValue, err := strconv.ParseFloat(val, 64)
-		if err != nil {
-			return nil, fmt.Errorf("value must be a float")
-		}
-		meta.activationValue = activationValue
+	err := config.TypedConfig(&meta)
+	if err != nil {
+		return meta, fmt.Errorf("error parsing kubernetes workload metadata: %w", err)
 	}
 
-	meta.scalerIndex = config.ScalerIndex
+	selector, err := labels.Parse(meta.PodSelector)
+	if err != nil {
+		return meta, fmt.Errorf("error parsing pod selector: %w", err)
+	}
+	meta.podSelector = selector
+
 	return meta, nil
 }
 
-// Close no need for kubernetes workload scaler
 func (s *kubernetesWorkloadScaler) Close(context.Context) error {
 	return nil
 }
 
 // GetMetricSpecForScaling returns the metric spec for the HPA
 func (s *kubernetesWorkloadScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
+	metricName := kedautil.NormalizeString(fmt.Sprintf("workload-%s", s.metadata.namespace))
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("workload-%s", s.metadata.namespace))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, metricName),
 		},
-		Target: GetMetricTargetMili(s.metricType, s.metadata.value),
+		Target: GetMetricTargetMili(s.metricType, s.metadata.Value),
 	}
 	metricSpec := v2.MetricSpec{External: externalMetric, Type: kubernetesWorkloadMetricType}
 	return []v2.MetricSpec{metricSpec}
@@ -116,19 +116,17 @@ func (s *kubernetesWorkloadScaler) GetMetricsAndActivity(ctx context.Context, me
 
 	metric := GenerateMetricInMili(metricName, float64(pods))
 
-	return []external_metrics.ExternalMetricValue{metric}, float64(pods) > s.metadata.activationValue, nil
+	return []external_metrics.ExternalMetricValue{metric}, float64(pods) > s.metadata.ActivationValue, nil
 }
 
 func (s *kubernetesWorkloadScaler) getMetricValue(ctx context.Context) (int64, error) {
 	podList := &corev1.PodList{}
-	listOptions := client.ListOptions{}
-	listOptions.LabelSelector = s.metadata.podSelector
-	listOptions.Namespace = s.metadata.namespace
-	opts := []client.ListOption{
-		&listOptions,
+	listOptions := client.ListOptions{
+		LabelSelector: s.metadata.podSelector,
+		Namespace:     s.metadata.namespace,
 	}
 
-	err := s.kubeClient.List(ctx, podList, opts...)
+	err := s.kubeClient.List(ctx, podList, &listOptions)
 	if err != nil {
 		return 0, err
 	}

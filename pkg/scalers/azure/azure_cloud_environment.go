@@ -4,8 +4,15 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	az "github.com/Azure/go-autorest/autorest/azure"
 )
+
+var AzureClouds = map[string]cloud.Configuration{
+	"AZUREPUBLICCLOUD":       cloud.AzurePublic,
+	"AZUREUSGOVERNMENTCLOUD": cloud.AzureGovernment,
+	"AZURECHINACLOUD":        cloud.AzureChina,
+}
 
 const (
 	DefaultCloud = "azurePublicCloud"
@@ -13,11 +20,14 @@ const (
 	// PrivateCloud cloud type
 	PrivateCloud string = "Private"
 
-	// Default Endpoint key in trigger metadata
+	// DefaultEndpointSuffixKey is the default endpoint key in trigger metadata
 	DefaultEndpointSuffixKey string = "endpointSuffix"
 
-	// Default Storage Endpoint key in trigger metadata
+	// DefaultStorageSuffixKey is the default storage endpoint key in trigger metadata
 	DefaultStorageSuffixKey string = "storageEndpointSuffix"
+
+	// DefaultActiveDirectoryEndpointKey is the default active directory endpoint key in trigger metadata
+	DefaultActiveDirectoryEndpointKey string = "activeDirectoryEndpoint"
 )
 
 // EnvironmentPropertyProvider for different types of Azure scalers
@@ -50,5 +60,5 @@ func ParseEnvironmentProperty(metadata map[string]string, propertyKey string, en
 }
 
 func ParseActiveDirectoryEndpoint(metadata map[string]string) (string, error) {
-	return ParseEnvironmentProperty(metadata, "activeDirectoryEndpoint", activeDirectoryEndpointProvider)
+	return ParseEnvironmentProperty(metadata, DefaultActiveDirectoryEndpointKey, activeDirectoryEndpointProvider)
 }

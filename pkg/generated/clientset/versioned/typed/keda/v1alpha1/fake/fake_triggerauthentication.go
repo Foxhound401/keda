@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The KEDA Authors
+Copyright 2024 The KEDA Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ import (
 	v1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	labels "k8s.io/apimachinery/pkg/labels"
-	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	types "k8s.io/apimachinery/pkg/types"
 	watch "k8s.io/apimachinery/pkg/watch"
 	testing "k8s.io/client-go/testing"
@@ -36,28 +35,30 @@ type FakeTriggerAuthentications struct {
 	ns   string
 }
 
-var triggerauthenticationsResource = schema.GroupVersionResource{Group: "keda", Version: "v1alpha1", Resource: "triggerauthentications"}
+var triggerauthenticationsResource = v1alpha1.SchemeGroupVersion.WithResource("triggerauthentications")
 
-var triggerauthenticationsKind = schema.GroupVersionKind{Group: "keda", Version: "v1alpha1", Kind: "TriggerAuthentication"}
+var triggerauthenticationsKind = v1alpha1.SchemeGroupVersion.WithKind("TriggerAuthentication")
 
 // Get takes name of the triggerAuthentication, and returns the corresponding triggerAuthentication object, and an error if there is any.
 func (c *FakeTriggerAuthentications) Get(ctx context.Context, name string, options v1.GetOptions) (result *v1alpha1.TriggerAuthentication, err error) {
+	emptyResult := &v1alpha1.TriggerAuthentication{}
 	obj, err := c.Fake.
-		Invokes(testing.NewGetAction(triggerauthenticationsResource, c.ns, name), &v1alpha1.TriggerAuthentication{})
+		Invokes(testing.NewGetActionWithOptions(triggerauthenticationsResource, c.ns, name, options), emptyResult)
 
 	if obj == nil {
-		return nil, err
+		return emptyResult, err
 	}
 	return obj.(*v1alpha1.TriggerAuthentication), err
 }
 
 // List takes label and field selectors, and returns the list of TriggerAuthentications that match those selectors.
 func (c *FakeTriggerAuthentications) List(ctx context.Context, opts v1.ListOptions) (result *v1alpha1.TriggerAuthenticationList, err error) {
+	emptyResult := &v1alpha1.TriggerAuthenticationList{}
 	obj, err := c.Fake.
-		Invokes(testing.NewListAction(triggerauthenticationsResource, triggerauthenticationsKind, c.ns, opts), &v1alpha1.TriggerAuthenticationList{})
+		Invokes(testing.NewListActionWithOptions(triggerauthenticationsResource, triggerauthenticationsKind, c.ns, opts), emptyResult)
 
 	if obj == nil {
-		return nil, err
+		return emptyResult, err
 	}
 
 	label, _, _ := testing.ExtractFromListOptions(opts)
@@ -76,28 +77,43 @@ func (c *FakeTriggerAuthentications) List(ctx context.Context, opts v1.ListOptio
 // Watch returns a watch.Interface that watches the requested triggerAuthentications.
 func (c *FakeTriggerAuthentications) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
 	return c.Fake.
-		InvokesWatch(testing.NewWatchAction(triggerauthenticationsResource, c.ns, opts))
+		InvokesWatch(testing.NewWatchActionWithOptions(triggerauthenticationsResource, c.ns, opts))
 
 }
 
 // Create takes the representation of a triggerAuthentication and creates it.  Returns the server's representation of the triggerAuthentication, and an error, if there is any.
 func (c *FakeTriggerAuthentications) Create(ctx context.Context, triggerAuthentication *v1alpha1.TriggerAuthentication, opts v1.CreateOptions) (result *v1alpha1.TriggerAuthentication, err error) {
+	emptyResult := &v1alpha1.TriggerAuthentication{}
 	obj, err := c.Fake.
-		Invokes(testing.NewCreateAction(triggerauthenticationsResource, c.ns, triggerAuthentication), &v1alpha1.TriggerAuthentication{})
+		Invokes(testing.NewCreateActionWithOptions(triggerauthenticationsResource, c.ns, triggerAuthentication, opts), emptyResult)
 
 	if obj == nil {
-		return nil, err
+		return emptyResult, err
 	}
 	return obj.(*v1alpha1.TriggerAuthentication), err
 }
 
 // Update takes the representation of a triggerAuthentication and updates it. Returns the server's representation of the triggerAuthentication, and an error, if there is any.
 func (c *FakeTriggerAuthentications) Update(ctx context.Context, triggerAuthentication *v1alpha1.TriggerAuthentication, opts v1.UpdateOptions) (result *v1alpha1.TriggerAuthentication, err error) {
+	emptyResult := &v1alpha1.TriggerAuthentication{}
 	obj, err := c.Fake.
-		Invokes(testing.NewUpdateAction(triggerauthenticationsResource, c.ns, triggerAuthentication), &v1alpha1.TriggerAuthentication{})
+		Invokes(testing.NewUpdateActionWithOptions(triggerauthenticationsResource, c.ns, triggerAuthentication, opts), emptyResult)
 
 	if obj == nil {
-		return nil, err
+		return emptyResult, err
+	}
+	return obj.(*v1alpha1.TriggerAuthentication), err
+}
+
+// UpdateStatus was generated because the type contains a Status member.
+// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
+func (c *FakeTriggerAuthentications) UpdateStatus(ctx context.Context, triggerAuthentication *v1alpha1.TriggerAuthentication, opts v1.UpdateOptions) (result *v1alpha1.TriggerAuthentication, err error) {
+	emptyResult := &v1alpha1.TriggerAuthentication{}
+	obj, err := c.Fake.
+		Invokes(testing.NewUpdateSubresourceActionWithOptions(triggerauthenticationsResource, "status", c.ns, triggerAuthentication, opts), emptyResult)
+
+	if obj == nil {
+		return emptyResult, err
 	}
 	return obj.(*v1alpha1.TriggerAuthentication), err
 }
@@ -112,7 +128,7 @@ func (c *FakeTriggerAuthentications) Delete(ctx context.Context, name string, op
 
 // DeleteCollection deletes a collection of objects.
 func (c *FakeTriggerAuthentications) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(triggerauthenticationsResource, c.ns, listOpts)
+	action := testing.NewDeleteCollectionActionWithOptions(triggerauthenticationsResource, c.ns, opts, listOpts)
 
 	_, err := c.Fake.Invokes(action, &v1alpha1.TriggerAuthenticationList{})
 	return err
@@ -120,11 +136,12 @@ func (c *FakeTriggerAuthentications) DeleteCollection(ctx context.Context, opts 
 
 // Patch applies the patch and returns the patched triggerAuthentication.
 func (c *FakeTriggerAuthentications) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *v1alpha1.TriggerAuthentication, err error) {
+	emptyResult := &v1alpha1.TriggerAuthentication{}
 	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(triggerauthenticationsResource, c.ns, name, pt, data, subresources...), &v1alpha1.TriggerAuthentication{})
+		Invokes(testing.NewPatchSubresourceActionWithOptions(triggerauthenticationsResource, c.ns, name, pt, data, opts, subresources...), emptyResult)
 
 	if obj == nil {
-		return nil, err
+		return emptyResult, err
 	}
 	return obj.(*v1alpha1.TriggerAuthentication), err
 }
