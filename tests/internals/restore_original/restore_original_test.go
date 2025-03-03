@@ -52,7 +52,7 @@ spec:
     spec:
       containers:
         - name: {{.MonitoredDeploymentName}}
-          image: nginx
+          image: nginxinc/nginx-unprivileged
 `
 
 	deploymentTemplate = `
@@ -75,7 +75,7 @@ spec:
     spec:
       containers:
         - name: {{.DeploymentName}}
-          image: nginx
+          image: nginxinc/nginx-unprivileged
 `
 
 	scaledObjectTemplate = `
@@ -119,7 +119,7 @@ func TestScaler(t *testing.T) {
 	testRestore(t, kc, data)
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 }
 
 func getTemplateData() (templateData, []Template) {
@@ -138,8 +138,8 @@ func testScale(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scaling ---")
 	KubectlApplyWithTemplate(t, data, "scaledObjectTemplate", scaledObjectTemplate)
 
-	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 4, 60, 1),
-		"replica count should be 4 after 1 minute")
+	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 4, 60, 3),
+		"replica count should be 4 after 3 minute")
 }
 
 func testRestore(t *testing.T, kc *kubernetes.Clientset, data templateData) {

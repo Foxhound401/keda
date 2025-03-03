@@ -4,10 +4,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	v2 "k8s.io/api/autoscaling/v2"
 	v1 "k8s.io/api/core/v1"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type parseCPUMemoryMetadataTestData struct {
@@ -16,7 +17,6 @@ type parseCPUMemoryMetadataTestData struct {
 	isError    bool
 }
 
-// A complete valid metadata example for reference
 var validCPUMemoryMetadata = map[string]string{
 	"type":  "Utilization",
 	"value": "50",
@@ -42,24 +42,24 @@ var testCPUMemoryMetadata = []parseCPUMemoryMetadataTestData{
 }
 
 func TestCPUMemoryParseMetadata(t *testing.T) {
-	for _, testData := range testCPUMemoryMetadata {
-		config := &ScalerConfig{
+	for i, testData := range testCPUMemoryMetadata {
+		config := &scalersconfig.ScalerConfig{
 			TriggerMetadata: testData.metadata,
 			MetricType:      testData.metricType,
 		}
-		_, err := parseResourceMetadata(config, logr.Discard())
+		_, err := parseResourceMetadata(config)
 		if err != nil && !testData.isError {
-			t.Error("Expected success but got error", err)
+			t.Errorf("Test case %d: Expected success but got error: %v", i, err)
 		}
 		if testData.isError && err == nil {
-			t.Error("Expected error but got success")
+			t.Errorf("Test case %d: Expected error but got success", i)
 		}
 	}
 }
 
 func TestGetMetricSpecForScaling(t *testing.T) {
 	// Using trigger.metadata.type field for type
-	config := &ScalerConfig{
+	config := &scalersconfig.ScalerConfig{
 		TriggerMetadata: validCPUMemoryMetadata,
 	}
 	scaler, _ := NewCPUMemoryScaler(v1.ResourceCPU, config)
@@ -70,7 +70,7 @@ func TestGetMetricSpecForScaling(t *testing.T) {
 	assert.Equal(t, metricSpec[0].Resource.Target.Type, v2.UtilizationMetricType)
 
 	// Using trigger.metricType field for type
-	config = &ScalerConfig{
+	config = &scalersconfig.ScalerConfig{
 		TriggerMetadata: map[string]string{"value": "50"},
 		MetricType:      v2.UtilizationMetricType,
 	}
@@ -84,7 +84,7 @@ func TestGetMetricSpecForScaling(t *testing.T) {
 
 func TestGetContainerMetricSpecForScaling(t *testing.T) {
 	// Using trigger.metadata.type field for type
-	config := &ScalerConfig{
+	config := &scalersconfig.ScalerConfig{
 		TriggerMetadata: validContainerCPUMemoryMetadata,
 	}
 	scaler, _ := NewCPUMemoryScaler(v1.ResourceCPU, config)
@@ -96,7 +96,7 @@ func TestGetContainerMetricSpecForScaling(t *testing.T) {
 	assert.Equal(t, metricSpec[0].ContainerResource.Container, validContainerCPUMemoryMetadata["containerName"])
 
 	// Using trigger.metricType field for type
-	config = &ScalerConfig{
+	config = &scalersconfig.ScalerConfig{
 		TriggerMetadata: map[string]string{"value": "50", "containerName": "bar"},
 		MetricType:      v2.UtilizationMetricType,
 	}

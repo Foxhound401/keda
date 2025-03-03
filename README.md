@@ -1,9 +1,10 @@
 <p align="center"><img src="images/logos/keda-word-colour.png" width="300"/></p>
 <p style="font-size: 25px" align="center"><b>Kubernetes-based Event Driven Autoscaling</b></p>
 <p style="font-size: 25px" align="center">
-<a href="https://github.com/kedacore/keda/actions?query=workflow%3Amain-build"><img src="https://github.com/kedacore/keda/workflows/main-build/badge.svg" alt="main build"></a>
-<a href="https://github.com/kedacore/keda/actions?query=workflow%3Anightly-e2e-test"><img src="https://github.com/kedacore/keda/workflows/nightly-e2e-test/badge.svg" alt="nightly e2e"></a>
+<a href="https://github.com/kedacore/keda/actions?query=workflow%3Amain-build"><img src="https://github.com/kedacore/keda/actions/workflows/main-build.yml/badge.svg" alt="main build"></a>
+<a href="https://github.com/kedacore/keda/actions?query=workflow%3Anightly-e2e-test"><img src="https://github.com/kedacore/keda/actions/workflows/nightly-e2e.yml/badge.svg" alt="nightly e2e"></a>
 <a href="https://bestpractices.coreinfrastructure.org/projects/3791"><img src="https://bestpractices.coreinfrastructure.org/projects/3791/badge"></a>
+<a href="https://api.scorecard.dev/projects/github.com/kedacore/keda/badge"><img src="https://img.shields.io/ossf-scorecard/github.com/kedacore/keda?label=openssf%20scorecard&style=flat"></a>
 <a href="https://artifacthub.io/packages/helm/kedacore/keda"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/kedacore"></a>
 <a href="https://app.fossa.com/projects/custom%2B162%2Fgithub.com%2Fkedacore%2Fkeda?ref=badge_shield" alt="FOSSA Status"><img src="https://app.fossa.com/api/projects/custom%2B162%2Fgithub.com%2Fkedacore%2Fkeda.svg?type=shield"/></a>
 <a href="https://twitter.com/kedaorg"><img src="https://img.shields.io/twitter/follow/kedaorg?style=social" alt="Twitter"></a></p>
@@ -15,7 +16,7 @@ resource definition.
 KEDA can run on both the cloud and the edge, integrates natively with Kubernetes components such as the Horizontal
 Pod Autoscaler, and has no external dependencies.
 
-We are a Cloud Native Computing Foundation (CNCF) incubation project.
+We are a Cloud Native Computing Foundation (CNCF) graduated project.
 <p align="center"><img src="https://raw.githubusercontent.com/kedacore/keda/main/images/logo-cncf.svg" height="75px"></p>
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
@@ -28,10 +29,12 @@ We are a Cloud Native Computing Foundation (CNCF) incubation project.
 - [Community](#community)
 - [Adopters - Become a listed KEDA user!](#adopters---become-a-listed-keda-user)
 - [Governance & Policies](#governance--policies)
+- [Support](#support)
 - [Roadmap](#roadmap)
 - [Releases](#releases)
 - [Contributing](#contributing)
   - [Building & deploying locally](#building--deploying-locally)
+  - [Testing strategy](#testing-strategy)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
@@ -67,6 +70,10 @@ We are always happy to [list users](https://keda.sh/community/#users) who run KE
 
 You can learn about the governance of KEDA [here](https://github.com/kedacore/governance).
 
+## Support
+
+Details on the KEDA support policy can found [here](https://keda.sh/support/).
+
 ## Roadmap
 
 We use GitHub issues to build our backlog, a complete overview of all open items and our planning.
@@ -83,3 +90,6 @@ You can find contributing guide [here](./CONTRIBUTING.md).
 
 ### Building & deploying locally
 Learn how to build & deploy KEDA locally [here](./BUILD.md).
+
+### Testing strategy
+Learn more about our testing strategy [here](./TESTING.md).

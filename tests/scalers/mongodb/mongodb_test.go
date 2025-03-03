@@ -12,6 +12,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -48,48 +49,6 @@ type templateData struct {
 }
 
 const (
-	mongoTemplate = `
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mongodb
-  namespace: {{.MongoNamespace}}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      name: mongodb
-  template:
-    metadata:
-      labels:
-        name: mongodb
-      namespace: {{.MongoNamespace}}
-    spec:
-      containers:
-      - name: mongodb
-        image: mongo:4.2.1
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 27017
-          name: mongodb
-          protocol: TCP
----
-kind: Service
-apiVersion: v1
-metadata:
-  name: mongodb-svc
-  namespace: {{.MongoNamespace}}
-spec:
-  type: ClusterIP
-  ports:
-  - name: mongodb
-    port: 27017
-    targetPort: 27017
-    protocol: TCP
-  selector:
-    name: mongodb
-`
-
 	secretTemplate = `
 apiVersion: v1
 kind: Secret
@@ -156,24 +115,23 @@ func TestScaler(t *testing.T) {
 	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
 	data, templates := getTemplateData()
-
+	t.Cleanup(func() {
+		cleanupMongo(t)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
 	mongoPod := setupMongo(t, kc)
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
-	assert.True(t, WaitForJobCount(t, kc, testNamespace, 0, 60, 1),
+	assert.True(t, WaitForScaledJobCount(t, kc, scaledJobName, testNamespace, 0, 60, 1),
 		"job count should be 0 after 1 minute")
 
 	// test scaling
 	testActivation(t, kc, mongoPod)
 	testScaleOut(t, kc, mongoPod)
-
-	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
-	cleanupMongo(t, kc)
 }
 
 func getTemplateData() (templateData, []Template) {
-	connectionString := fmt.Sprintf("mongodb://%s:%s@mongodb-svc.%s.svc.cluster.local:27017/%s",
+	connectionString := fmt.Sprintf("mongodb://%s:%s@mongodb.%s.svc.cluster.local:27017/%s",
 		mongoUser, mongoPassword, mongoNamespace, mongoDBName)
 	base64ConnectionString := base64.StdEncoding.EncodeToString([]byte(connectionString))
 
@@ -196,13 +154,15 @@ func getTemplateData() (templateData, []Template) {
 
 func setupMongo(t *testing.T, kc *kubernetes.Clientset) string {
 	CreateNamespace(t, kc, mongoNamespace)
-
-	KubectlApplyWithTemplate(t, templateData{MongoNamespace: mongoNamespace}, "mongoTemplate", mongoTemplate)
-	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, "mongodb", mongoNamespace, 1, 60, 1),
-		"mongodb is not ready")
+	_, err := ExecuteCommand("helm repo add bitnami https://charts.bitnami.com/bitnami")
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
+	_, err = ExecuteCommand("helm repo update")
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
+	_, err = ExecuteCommand(fmt.Sprintf("helm install mongodb --set architecture=standalone --set auth.enabled=false --set persistence.enabled=false --namespace %s bitnami/mongodb --wait", mongoNamespace))
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 
 	podList, err := kc.CoreV1().Pods(mongoNamespace).List(context.Background(), metav1.ListOptions{})
-	assert.NoErrorf(t, err, "cannot get mongo pod - %s", err)
+	require.NoErrorf(t, err, "cannot get mongo pod - %s", err)
 
 	if len(podList.Items) != 1 {
 		t.Error("cannot get mongo pod name")
@@ -213,12 +173,12 @@ func setupMongo(t *testing.T, kc *kubernetes.Clientset) string {
 
 	createUserCmd := fmt.Sprintf("db.createUser({ user:\"%s\",pwd:\"%s\",roles:[{ role:\"readWrite\", db: \"%s\"}]})",
 		mongoUser, mongoPassword, mongoDBName)
-	_, err = ExecuteCommand(fmt.Sprintf("kubectl exec %s -n %s -- mongo --eval '%s'", mongoPod, mongoNamespace, createUserCmd))
-	assert.NoErrorf(t, err, "cannot create user - %s", err)
+	_, err = ExecuteCommand(fmt.Sprintf("kubectl exec %s -n %s -- mongosh --eval '%s'", mongoPod, mongoNamespace, createUserCmd))
+	require.NoErrorf(t, err, "cannot create user - %s", err)
 
 	loginCmd := fmt.Sprintf("db.auth(\"%s\",\"%s\")", mongoUser, mongoPassword)
-	_, err = ExecuteCommand(fmt.Sprintf("kubectl exec %s -n %s -- mongo --eval '%s'", mongoPod, mongoNamespace, loginCmd))
-	assert.NoErrorf(t, err, "cannot login - %s", err)
+	_, err = ExecuteCommand(fmt.Sprintf("kubectl exec %s -n %s -- mongosh --eval '%s'", mongoPod, mongoNamespace, loginCmd))
+	require.NoErrorf(t, err, "cannot login - %s", err)
 
 	return mongoPod
 }
@@ -231,10 +191,10 @@ func testActivation(t *testing.T, kc *kubernetes.Clientset, mongoPod string) {
 		{"region":"eu-1","state":"running","plan":"planA","goods":"orange"}
 		])`, mongoCollection)
 
-	_, err := ExecuteCommand(fmt.Sprintf("kubectl exec %s -n %s -- mongo --eval '%s'", mongoPod, mongoNamespace, insertCmd))
+	_, err := ExecuteCommand(fmt.Sprintf("kubectl exec %s -n %s -- mongosh --eval '%s'", mongoPod, mongoNamespace, insertCmd))
 	assert.NoErrorf(t, err, "cannot insert mongo records - %s", err)
 	time.Sleep(time.Second * 60)
-	assert.True(t, WaitForJobCount(t, kc, testNamespace, 0, 60, 1),
+	assert.True(t, WaitForScaledJobCount(t, kc, scaledJobName, testNamespace, 0, 60, 1),
 		"job count should be 0 after 1 minute")
 }
 
@@ -247,14 +207,15 @@ func testScaleOut(t *testing.T, kc *kubernetes.Clientset, mongoPod string) {
 		{"region":"eu-1","state":"running","plan":"planA","goods":"pineapple"}
 		])`, mongoCollection)
 
-	_, err := ExecuteCommand(fmt.Sprintf("kubectl exec %s -n %s -- mongo --eval '%s'", mongoPod, mongoNamespace, insertCmd))
+	_, err := ExecuteCommand(fmt.Sprintf("kubectl exec %s -n %s -- mongosh --eval '%s'", mongoPod, mongoNamespace, insertCmd))
 	assert.NoErrorf(t, err, "cannot insert mongo records - %s", err)
 
-	assert.True(t, WaitForJobCount(t, kc, testNamespace, 5, 60, 1),
+	assert.True(t, WaitForScaledJobCount(t, kc, scaledJobName, testNamespace, 5, 60, 1),
 		"job count should be 5 after 1 minute")
 }
 
-func cleanupMongo(t *testing.T, kc *kubernetes.Clientset) {
-	KubectlDeleteWithTemplate(t, templateData{MongoNamespace: mongoNamespace}, "mongoTemplate", mongoTemplate)
-	DeleteNamespace(t, kc, mongoNamespace)
+func cleanupMongo(t *testing.T) {
+	_, err := ExecuteCommand(fmt.Sprintf("helm uninstall mongodb --namespace %s", mongoNamespace))
+	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	DeleteNamespace(t, mongoNamespace)
 }

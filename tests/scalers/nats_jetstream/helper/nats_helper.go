@@ -18,11 +18,11 @@ type JetStreamTemplateData struct {
 }
 
 const (
-	NatsJetStreamName          = "nats"
-	NatsJetStreamStreamName    = "mystream"
-	NatsJetStreamConsumerName  = "PULL_CONSUMER"
-	NatsJetStreamChartVersion  = "0.18.2"
-	NatsJetStreamServerVersion = "2.9.3"
+	NatsJetStreamName              = "nats"
+	NatsJetStreamConsumerName      = "PULL_CONSUMER"
+	Natsv2_10JetStreamChartVersion = "1.1.2"
+	NatsJetStreamChartVersion      = "0.18.2"
+	NatsJetStreamServerVersion     = "2.9.3"
 )
 
 type JetStreamDeploymentTemplateData struct {
@@ -46,21 +46,20 @@ func GetJetStreamDeploymentTemplateData(
 			NatsServerMonitoringEndpoint: natsServerMonitoringEndpoint,
 			NumberOfMessages:             messagePublishCount,
 			NatsConsumer:                 NatsJetStreamConsumerName,
-			NatsStream:                   NatsJetStreamStreamName,
 		}, []h.Template{
 			{Name: "deploymentTemplate", Config: DeploymentTemplate},
-			{Name: "scaledObjectTemplate", Config: ScaledObjectTemplate},
 		}
 }
 
 const (
-	StreamAndConsumerTemplate = `
+	DeleteStreamTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: stream
+  name: delete-stream
   namespace: {{.TestNamespace}}
 spec:
+  ttlSecondsAfterFinished: 15
   template:
     spec:
       containers:
@@ -69,7 +68,28 @@ spec:
         imagePullPolicy: Always
         command: [
           'sh', '-c', 'nats context save local --server {{.NatsAddress}} --select &&
-          nats stream rm {{.NatsStream}} -f ;
+          nats stream rm {{.NatsStream}} -f ;'
+        ]
+      restartPolicy: OnFailure
+  backoffLimit: 4
+  `
+
+	StreamAndConsumerTemplate = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stream
+  namespace: {{.TestNamespace}}
+spec:
+  ttlSecondsAfterFinished: 15
+  template:
+    spec:
+      containers:
+      - name: stream
+        image: "natsio/nats-box:0.13.2"
+        imagePullPolicy: Always
+        command: [
+          'sh', '-c', 'nats context save local --server {{.NatsAddress}} --select &&
           nats stream add {{.NatsStream}} --replicas={{.StreamReplicas}} --storage=memory --subjects="ORDERS.*"
                                           --retention=limits --discard=old --max-msgs="-1" --max-msgs-per-subject="-1"
                                           --max-bytes="-1" --max-age="-1" --max-msg-size="-1" --dupe-window=2m
@@ -77,8 +97,30 @@ spec:
           nats consumer add {{.NatsStream}} {{.NatsConsumer}} --pull --deliver=all --ack=explicit --replay=instant
                                                               --filter="" --max-deliver="-1" --max-pending=1000
                                                               --no-headers-only --wait=5s --backoff=none'
-				]
-      restartPolicy: Never
+        ]
+      restartPolicy: OnFailure
+  backoffLimit: 4
+  `
+
+	StepDownConsumer = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: step-down
+  namespace: {{.TestNamespace}}
+spec:
+  ttlSecondsAfterFinished: 15
+  template:
+    spec:
+      containers:
+      - name: stepdown
+        image: "natsio/nats-box:0.13.2"
+        imagePullPolicy: Always
+        command: [
+          'sh', '-c', 'nats context save local --server {{.NatsAddress}} --select &&
+          nats consumer cluster step-down {{.NatsStream}} {{.NatsConsumer}}'
+        ]
+      restartPolicy: OnFailure
   backoffLimit: 4
   `
 
@@ -100,9 +142,11 @@ spec:
     spec:
       containers:
       - name: sub
-        image: "goku321/nats-consumer:v0.9"
+        image: "ghcr.io/kedacore/tests-nats-jetstream"
         imagePullPolicy: Always
-        command: ["./main"]
+        command:
+        - /app
+        - consumer
         env:
         - name: NATS_ADDRESS
           value: {{.NatsAddress}}
@@ -115,20 +159,22 @@ metadata:
   name: pub
   namespace: {{.TestNamespace}}
 spec:
-  ttlSecondsAfterFinished: 0
+  ttlSecondsAfterFinished: 15
   template:
     spec:
       containers:
       - name: pub
-        image: "goku321/nats-publisher:v0.2"
+        image: "ghcr.io/kedacore/tests-nats-jetstream"
         imagePullPolicy: Always
-        command: ["./main"]
+        command:
+        - /app
+        - publisher
         env:
         - name: NATS_ADDRESS
           value: {{.NatsAddress}}
         - name: NUM_MESSAGES
           value: "{{.NumberOfMessages}}"
-      restartPolicy: Never
+      restartPolicy: OnFailure
   backoffLimit: 4
 `
 
@@ -136,7 +182,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: pub0
+  name: pub
   namespace: {{.TestNamespace}}
 spec:
   ttlSecondsAfterFinished: 0
@@ -144,15 +190,17 @@ spec:
     spec:
       containers:
       - name: pub
-        image: "goku321/nats-publisher:v0.2"
+        image: "ghcr.io/kedacore/tests-nats-jetstream"
         imagePullPolicy: Always
-        command: ["./main"]
+        command:
+        - /app
+        - publisher
         env:
         - name: NATS_ADDRESS
           value: {{.NatsAddress}}
         - name: NUM_MESSAGES
           value: "{{.NumberOfMessages}}"
-      restartPolicy: Never
+      restartPolicy: OnFailure
   backoffLimit: 4
 `
 

@@ -10,6 +10,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type workloadMetadataTestData struct {
@@ -36,7 +38,13 @@ var parseWorkloadMetadataTestDataset = []workloadMetadataTestData{
 
 func TestParseWorkloadMetadata(t *testing.T) {
 	for _, testData := range parseWorkloadMetadataTestDataset {
-		_, err := parseWorkloadMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, ScalableObjectNamespace: testData.namespace})
+		_, err := NewKubernetesWorkloadScaler(
+			fake.NewClientBuilder().Build(),
+			&scalersconfig.ScalerConfig{
+				TriggerMetadata:         testData.metadata,
+				ScalableObjectNamespace: testData.namespace,
+			},
+		)
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
 		}
@@ -66,15 +74,19 @@ var isActiveWorkloadTestDataset = []workloadIsActiveTestData{
 
 func TestWorkloadIsActive(t *testing.T) {
 	for _, testData := range isActiveWorkloadTestDataset {
-		s, _ := NewKubernetesWorkloadScaler(
+		s, err := NewKubernetesWorkloadScaler(
 			fake.NewClientBuilder().WithRuntimeObjects(createPodlist(testData.podCount)).Build(),
-			&ScalerConfig{
+			&scalersconfig.ScalerConfig{
 				TriggerMetadata:         testData.metadata,
 				AuthParams:              map[string]string{},
 				GlobalHTTPTimeout:       1000 * time.Millisecond,
 				ScalableObjectNamespace: testData.namespace,
 			},
 		)
+		if err != nil {
+			t.Error("Error creating scaler", err)
+			continue
+		}
 		_, isActive, _ := s.GetMetricsAndActivity(context.TODO(), "Metric")
 		if testData.active && !isActive {
 			t.Error("Expected active but got inactive")
@@ -86,10 +98,10 @@ func TestWorkloadIsActive(t *testing.T) {
 }
 
 type workloadGetMetricSpecForScalingTestData struct {
-	metadata    map[string]string
-	namespace   string
-	scalerIndex int
-	name        string
+	metadata     map[string]string
+	namespace    string
+	triggerIndex int
+	name         string
 }
 
 var getMetricSpecForScalingTestDataset = []workloadGetMetricSpecForScalingTestData{
@@ -105,16 +117,20 @@ var getMetricSpecForScalingTestDataset = []workloadGetMetricSpecForScalingTestDa
 
 func TestWorkloadGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range getMetricSpecForScalingTestDataset {
-		s, _ := NewKubernetesWorkloadScaler(
+		s, err := NewKubernetesWorkloadScaler(
 			fake.NewClientBuilder().Build(),
-			&ScalerConfig{
+			&scalersconfig.ScalerConfig{
 				TriggerMetadata:         testData.metadata,
 				AuthParams:              map[string]string{},
 				GlobalHTTPTimeout:       1000 * time.Millisecond,
 				ScalableObjectNamespace: testData.namespace,
-				ScalerIndex:             testData.scalerIndex,
+				TriggerIndex:            testData.triggerIndex,
 			},
 		)
+		if err != nil {
+			t.Error("Error creating scaler", err)
+			continue
+		}
 		metric := s.GetMetricSpecForScaling(context.Background())
 
 		if metric[0].External.Metric.Name != testData.name {
@@ -143,14 +159,11 @@ func createPodlist(count int) *v1.PodList {
 
 func TestWorkloadPhase(t *testing.T) {
 	phases := map[v1.PodPhase]bool{
-		v1.PodRunning: true,
-		// succeeded and failed clearly count as terminated
+		v1.PodRunning:   true,
 		v1.PodSucceeded: false,
 		v1.PodFailed:    false,
-		// unknown could be for example a temporarily unresponsive node; count the pod
-		v1.PodUnknown: true,
-		// count pre-Running to avoid an additional delay on top of the poll interval
-		v1.PodPending: true,
+		v1.PodUnknown:   true,
+		v1.PodPending:   true,
 	}
 	for phase, active := range phases {
 		list := &v1.PodList{}
@@ -170,7 +183,7 @@ func TestWorkloadPhase(t *testing.T) {
 		list.Items = append(list.Items, *pod)
 		s, err := NewKubernetesWorkloadScaler(
 			fake.NewClientBuilder().WithRuntimeObjects(list).Build(),
-			&ScalerConfig{
+			&scalersconfig.ScalerConfig{
 				TriggerMetadata: map[string]string{
 					"podSelector": "app=testphases",
 					"value":       "1",

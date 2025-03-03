@@ -1,6 +1,26 @@
-// Copyright (c) 2012 The gocql Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Content before git sha 34fdeebefcbf183ed7f916f931aa0586fdaa1b40
+ * Copyright (c) 2012, The Gocql authors,
+ * provided under the BSD-3-Clause License.
+ * See the NOTICE file distributed with this work for additional information.
+ */
 
 package gocql
 
@@ -918,6 +938,10 @@ type preparedMetadata struct {
 
 	// proto v4+
 	pkeyColumns []int
+
+	keyspace string
+
+	table string
 }
 
 func (r preparedMetadata) String() string {
@@ -952,11 +976,10 @@ func (f *framer) parsePreparedMetadata() preparedMetadata {
 		return meta
 	}
 
-	var keyspace, table string
 	globalSpec := meta.flags&flagGlobalTableSpec == flagGlobalTableSpec
 	if globalSpec {
-		keyspace = f.readString()
-		table = f.readString()
+		meta.keyspace = f.readString()
+		meta.table = f.readString()
 	}
 
 	var cols []ColumnInfo
@@ -964,14 +987,14 @@ func (f *framer) parsePreparedMetadata() preparedMetadata {
 		// preallocate columninfo to avoid excess copying
 		cols = make([]ColumnInfo, meta.colCount)
 		for i := 0; i < meta.colCount; i++ {
-			f.readCol(&cols[i], &meta.resultMetadata, globalSpec, keyspace, table)
+			f.readCol(&cols[i], &meta.resultMetadata, globalSpec, meta.keyspace, meta.table)
 		}
 	} else {
 		// use append, huge number of columns usually indicates a corrupt frame or
 		// just a huge row.
 		for i := 0; i < meta.colCount; i++ {
 			var col ColumnInfo
-			f.readCol(&col, &meta.resultMetadata, globalSpec, keyspace, table)
+			f.readCol(&col, &meta.resultMetadata, globalSpec, meta.keyspace, meta.table)
 			cols = append(cols, col)
 		}
 	}

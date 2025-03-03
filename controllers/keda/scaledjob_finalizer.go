@@ -22,8 +22,10 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 
+	eventingv1alpha1 "github.com/kedacore/keda/v2/apis/eventing/v1alpha1"
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/controllers/keda/util"
+	"github.com/kedacore/keda/v2/pkg/common/message"
 	"github.com/kedacore/keda/v2/pkg/eventreason"
 )
 
@@ -50,11 +52,14 @@ func (r *ScaledJobReconciler) finalizeScaledJob(ctx context.Context, logger logr
 			return err
 		}
 
+		if _, err := r.updateTriggerAuthenticationStatusOnDelete(ctx, logger, scaledJob); err != nil {
+			logger.Error(err, "Failed to update TriggerAuthentication Status after removing a finalizer")
+		}
 		r.updatePromMetricsOnDelete(namespacedName)
 	}
 
 	logger.Info("Successfully finalized ScaledJob")
-	r.Recorder.Event(scaledJob, corev1.EventTypeNormal, eventreason.ScaledJobDeleted, "ScaledJob was deleted")
+	r.EventEmitter.Emit(scaledJob, namespacedName, corev1.EventTypeWarning, eventingv1alpha1.ScaledJobRemovedType, eventreason.ScaledJobDeleted, message.ScaledJobRemoved)
 	return nil
 }
 

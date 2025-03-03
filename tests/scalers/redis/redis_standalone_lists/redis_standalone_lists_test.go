@@ -165,35 +165,35 @@ spec:
 func TestScaler(t *testing.T) {
 	// Create kubernetes resources for PostgreSQL server
 	kc := GetKubernetesClient(t)
+	data, templates := getTemplateData()
+	t.Cleanup(func() {
+		redis.RemoveStandalone(t, testName, redisNamespace)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
 
 	// Create Redis Standalone
 	redis.InstallStandalone(t, kc, testName, redisNamespace, redisPassword)
 
 	// Create kubernetes resources for testing
-	data, templates := getTemplateData()
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
 	testActivation(t, kc, data)
 	testScaleOut(t, kc, data)
 	testScaleIn(t, kc)
-
-	// cleanup
-	redis.RemoveStandalone(t, kc, testName, redisNamespace)
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
 }
 
 func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing activation ---")
 	data.ItemsToWrite = 5
-	KubectlApplyWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
 }
 
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale out ---")
-	data.ItemsToWrite = 200
-	KubectlApplyWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
+	data.ItemsToWrite = 400
+	KubectlReplaceWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
 		"replica count should be %d after 3 minutes", maxReplicaCount)

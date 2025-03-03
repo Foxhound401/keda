@@ -20,6 +20,11 @@ import (
 type TokenProvider struct {
 	tokenCred        azcore.TokenCredential
 	sasTokenProvider *sas.TokenProvider
+
+	// InsecureDisableTLS disables TLS. This is only used if the user is connecting to localhost
+	// and is using an emulator connection string. See [ConnectionStringProperties.Emulator] for
+	// details.
+	InsecureDisableTLS bool
 }
 
 // NewTokenProvider creates a tokenProvider from azcore.TokenCredential.
@@ -28,16 +33,16 @@ func NewTokenProvider(tokenCredential azcore.TokenCredential) *TokenProvider {
 }
 
 // NewTokenProviderWithConnectionString creates a tokenProvider from a connection string.
-func NewTokenProviderWithConnectionString(parsed *conn.ParsedConn) (*TokenProvider, error) {
+func NewTokenProviderWithConnectionString(props conn.ConnectionStringProperties) (*TokenProvider, error) {
 	// NOTE: this is the value we've been using since forever. AFAIK, it's arbitrary.
 	const defaultTokenExpiry = 2 * time.Hour
 
 	var authOption sas.TokenProviderOption
 
-	if parsed.SAS == "" {
-		authOption = sas.TokenProviderWithKey(parsed.KeyName, parsed.Key, defaultTokenExpiry)
+	if props.SharedAccessSignature == nil {
+		authOption = sas.TokenProviderWithKey(*props.SharedAccessKeyName, *props.SharedAccessKey, defaultTokenExpiry)
 	} else {
-		authOption = sas.TokenProviderWithSAS(parsed.SAS)
+		authOption = sas.TokenProviderWithSAS(*props.SharedAccessSignature)
 	}
 
 	provider, err := sas.NewTokenProvider(authOption)
@@ -46,7 +51,7 @@ func NewTokenProviderWithConnectionString(parsed *conn.ParsedConn) (*TokenProvid
 		return nil, err
 	}
 
-	return &TokenProvider{sasTokenProvider: provider}, nil
+	return &TokenProvider{sasTokenProvider: provider, InsecureDisableTLS: props.Emulator}, nil
 }
 
 // singleUseTokenProvider allows you to wrap an *auth.Token so it can be used
@@ -117,8 +122,17 @@ func (tpa *TokenProvider) getSASToken(uri string) (*auth.Token, time.Time, error
 		return nil, time.Time{}, err
 	}
 
+	// we can ignore the error here since we did the string-izing of the time
+	// in the first place.
+	var expiryTime time.Time
+
+	if authToken.Expiry != "0" {
+		// TODO: I'd like to just use the actual Expiry time we generated
+		// Filed here https://github.com/Azure/azure-sdk-for-go/issues/20468
+		expiryTime = time.Now().Add(time.Minute * 15)
+	}
+
 	return authToken,
-		// expiration is hardcoded for SAS tokens
-		time.Now().Add(time.Minute * 15),
+		expiryTime,
 		nil
 }
