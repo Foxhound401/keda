@@ -21,9 +21,93 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"os"
 
 	"github.com/youmark/pkcs8"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
+
+var minTLSVersion uint16
+
+func init() {
+	var err error
+
+	if minTLSVersion, err = initMinTLSVersion(); err != nil {
+		ctrl.Log.WithName("tls_setup").Info(err.Error())
+	}
+}
+
+// NewTLSConfigWithPassword returns a *tls.Config using the given ceClient cert, ceClient key,
+// and CA certificate. If clientKeyPassword is not empty the provided password will be used to
+// decrypt the given key. If none are appropriate, a nil *tls.Config is returned.
+func NewTLSConfigWithPassword(clientCert, clientKey, clientKeyPassword, caCert string, unsafeSsl bool) (*tls.Config, error) {
+	config := CreateTLSClientConfig(unsafeSsl)
+
+	if clientCert != "" && clientKey != "" {
+		key := []byte(clientKey)
+		if clientKeyPassword != "" {
+			var err error
+			key, err = decryptClientKey(clientKey, clientKeyPassword)
+			if err != nil {
+				return nil, fmt.Errorf("error decrypt X509Key: %w", err)
+			}
+		}
+
+		cert, err := tls.X509KeyPair([]byte(clientCert), key)
+		if err != nil {
+			return nil, fmt.Errorf("error parse X509KeyPair: %w", err)
+		}
+		config.Certificates = []tls.Certificate{cert}
+	}
+
+	if caCert != "" {
+		config.RootCAs.AppendCertsFromPEM([]byte(caCert))
+	}
+
+	return config, nil
+}
+
+// NewTLSConfig returns a *tls.Config using the given ceClient cert, ceClient key,
+// and CA certificate. If none are appropriate, a nil *tls.Config is returned.
+func NewTLSConfig(clientCert, clientKey, caCert string, unsafeSsl bool) (*tls.Config, error) {
+	return NewTLSConfigWithPassword(clientCert, clientKey, "", caCert, unsafeSsl)
+}
+
+// CreateTLSClientConfig returns a new TLS Config
+// unsafeSsl parameter allows to avoid tls cert validation if it's required
+func CreateTLSClientConfig(unsafeSsl bool) *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: unsafeSsl,
+		RootCAs:            getRootCAs(),
+		MinVersion:         GetMinTLSVersion(),
+	}
+}
+
+// GetMinTLSVersion return the minTLSVersion based on configurations
+func GetMinTLSVersion() uint16 {
+	return minTLSVersion
+}
+
+func initMinTLSVersion() (uint16, error) {
+	version, _ := os.LookupEnv("KEDA_HTTP_MIN_TLS_VERSION")
+
+	switch version {
+	case "":
+		minTLSVersion = tls.VersionTLS12
+	case "TLS10":
+		minTLSVersion = tls.VersionTLS10
+	case "TLS11":
+		minTLSVersion = tls.VersionTLS11
+	case "TLS12":
+		minTLSVersion = tls.VersionTLS12
+	case "TLS13":
+		minTLSVersion = tls.VersionTLS13
+	default:
+		return tls.VersionTLS12, fmt.Errorf("%s is not a valid value, using `TLS12`. Allowed values are: `TLS13`,`TLS12`,`TLS11`,`TLS10`", version)
+	}
+
+	return minTLSVersion, nil
+}
 
 func decryptClientKey(clientKey, clientKeyPassword string) ([]byte, error) {
 	block, _ := pem.Decode([]byte(clientKey))
@@ -46,50 +130,4 @@ func decryptClientKey(clientKey, clientKeyPassword string) ([]byte, error) {
 	encodedData := pem.EncodeToMemory(pemPrivateBlock)
 
 	return encodedData, nil
-}
-
-// NewTLSConfigWithPassword returns a *tls.Config using the given ceClient cert, ceClient key,
-// and CA certificate. If clientKeyPassword is not empty the provided password will be used to
-// decrypt the given key. If none are appropriate, a nil *tls.Config is returned.
-func NewTLSConfigWithPassword(clientCert, clientKey, clientKeyPassword, caCert string) (*tls.Config, error) {
-	valid := false
-
-	config := &tls.Config{}
-
-	if clientCert != "" && clientKey != "" {
-		key := []byte(clientKey)
-		if clientKeyPassword != "" {
-			var err error
-			key, err = decryptClientKey(clientKey, clientKeyPassword)
-			if err != nil {
-				return nil, fmt.Errorf("error decrypt X509Key: %w", err)
-			}
-		}
-
-		cert, err := tls.X509KeyPair([]byte(clientCert), key)
-		if err != nil {
-			return nil, fmt.Errorf("error parse X509KeyPair: %w", err)
-		}
-		config.Certificates = []tls.Certificate{cert}
-		valid = true
-	}
-
-	if caCert != "" {
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM([]byte(caCert))
-		config.RootCAs = caCertPool
-		valid = true
-	}
-
-	if !valid {
-		config = nil
-	}
-
-	return config, nil
-}
-
-// NewTLSConfig returns a *tls.Config using the given ceClient cert, ceClient key,
-// and CA certificate. If none are appropriate, a nil *tls.Config is returned.
-func NewTLSConfig(clientCert, clientKey, caCert string) (*tls.Config, error) {
-	return NewTLSConfigWithPassword(clientCert, clientKey, "", caCert)
 }

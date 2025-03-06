@@ -1,7 +1,7 @@
 //
 // DISCLAIMER
 //
-// Copyright 2017 ArangoDB GmbH, Cologne, Germany
+// Copyright 2017-2023 ArangoDB GmbH, Cologne, Germany
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,6 @@
 // limitations under the License.
 //
 // Copyright holder is ArangoDB GmbH, Cologne, Germany
-//
-// Author Ewout Prangsma
 //
 
 package driver
@@ -39,7 +37,7 @@ type ClientServerAdmin interface {
 	Shutdown(ctx context.Context, removeFromCluster bool) error
 
 	// Metrics returns the metrics of the server in Prometheus format.
-	// List of metrics: https://www.arangodb.com/docs/devel/http/administration-and-monitoring-metrics.html
+	// List of metrics: https://docs.arangodb.com/stable/develop/http-api/monitoring/metrics/
 	// You can parse it using Prometheus client:
 	/*
 		var parser expfmt.TextParser
@@ -49,7 +47,7 @@ type ClientServerAdmin interface {
 
 	// MetricsForSingleServer returns the metrics of the specific server in Prometheus format.
 	// This parameter 'serverID' is only meaningful on Coordinators.
-	// List of metrics: https://www.arangodb.com/docs/devel/http/administration-and-monitoring-metrics.html
+	// List of metrics: https://docs.arangodb.com/stable/develop/http-api/monitoring/metrics/
 	// You can parse it using Prometheus client:
 	/*
 		var parser expfmt.TextParser
@@ -69,6 +67,9 @@ type ClientServerAdmin interface {
 
 	// Logs retrieve logs from server in ArangoDB 3.8.0+ format
 	Logs(ctx context.Context) (ServerLogs, error)
+
+	// GetLicense returns license of an ArangoDB deployment.
+	GetLicense(ctx context.Context) (License, error)
 }
 
 type ServerLogs struct {

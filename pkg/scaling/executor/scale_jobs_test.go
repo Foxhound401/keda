@@ -22,12 +22,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -78,13 +81,17 @@ func TestNewNewScalingStrategy(t *testing.T) {
 	assert.Equal(t, "executor.defaultScalingStrategy", fmt.Sprintf("%T", strategy))
 }
 
+func maxScaleValue(maxValue, _ int64) int64 {
+	return maxValue
+}
+
 func TestDefaultScalingStrategy(t *testing.T) {
 	logger := logf.Log.WithName("ScaledJobTest")
 	strategy := NewScalingStrategy(logger, getMockScaledJobWithDefaultStrategy("default"))
 	// maxScale doesn't exceed MaxReplicaCount. You can ignore on this sceanrio
 	// pendingJobCount isn't relevant on this scenario
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
-	assert.Equal(t, int64(2), strategy.GetEffectiveMaxScale(2, 0, 0, 5))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
+	assert.Equal(t, int64(2), maxScaleValue(strategy.GetEffectiveMaxScale(2, 0, 0, 5, 1)))
 }
 
 func TestCustomScalingStrategy(t *testing.T) {
@@ -94,13 +101,13 @@ func TestCustomScalingStrategy(t *testing.T) {
 	strategy := NewScalingStrategy(logger, getMockScaledJobWithStrategy("custom", "custom", customScalingQueueLengthDeduction, customScalingRunningJobPercentage))
 	// maxScale doesn't exceed MaxReplicaCount. You can ignore on this sceanrio
 	// pendingJobCount isn't relevant on this scenario
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
-	assert.Equal(t, int64(9), strategy.GetEffectiveMaxScale(10, 0, 0, 10))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
+	assert.Equal(t, int64(9), maxScaleValue(strategy.GetEffectiveMaxScale(10, 0, 0, 10, 1)))
 	strategy = NewScalingStrategy(logger, getMockScaledJobWithCustomStrategyWithNilParameter("custom", "custom"))
 
 	// If you don't set the two parameters is the same behavior as DefaultStrategy
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
-	assert.Equal(t, int64(2), strategy.GetEffectiveMaxScale(2, 0, 0, 5))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
+	assert.Equal(t, int64(2), maxScaleValue(strategy.GetEffectiveMaxScale(2, 0, 0, 5, 1)))
 
 	// Empty String will be DefaultStrategy
 	customScalingQueueLengthDeduction = int32(1)
@@ -112,25 +119,48 @@ func TestCustomScalingStrategy(t *testing.T) {
 	customScalingQueueLengthDeduction = int32(2)
 	customScalingRunningJobPercentage = "0"
 	strategy = NewScalingStrategy(logger, getMockScaledJobWithStrategy("custom", "custom", customScalingQueueLengthDeduction, customScalingRunningJobPercentage))
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
 
 	// Exceed the MaxReplicaCount
 	customScalingQueueLengthDeduction = int32(-2)
 	customScalingRunningJobPercentage = "0"
 	strategy = NewScalingStrategy(logger, getMockScaledJobWithStrategy("custom", "custom", customScalingQueueLengthDeduction, customScalingRunningJobPercentage))
-	assert.Equal(t, int64(4), strategy.GetEffectiveMaxScale(3, 2, 0, 4))
+	assert.Equal(t, int64(4), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 4, 1)))
 }
 
 func TestAccurateScalingStrategy(t *testing.T) {
 	logger := logf.Log.WithName("ScaledJobTest")
 	strategy := NewScalingStrategy(logger, getMockScaledJobWithStrategy("accurate", "accurate", 0, "0"))
 	// maxScale doesn't exceed MaxReplicaCount. You can ignore on this sceanrio
-	assert.Equal(t, int64(3), strategy.GetEffectiveMaxScale(3, 2, 0, 5))
-	assert.Equal(t, int64(3), strategy.GetEffectiveMaxScale(5, 2, 0, 5))
+	assert.Equal(t, int64(3), maxScaleValue(strategy.GetEffectiveMaxScale(3, 2, 0, 5, 1)))
+	assert.Equal(t, int64(3), maxScaleValue(strategy.GetEffectiveMaxScale(5, 2, 0, 5, 1)))
 
 	// Test with 2 pending jobs
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(3, 4, 2, 10))
-	assert.Equal(t, int64(1), strategy.GetEffectiveMaxScale(5, 4, 2, 5))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(3, 4, 2, 10, 1)))
+	assert.Equal(t, int64(1), maxScaleValue(strategy.GetEffectiveMaxScale(5, 4, 2, 5, 1)))
+}
+
+func TestEagerScalingStrategy(t *testing.T) {
+	logger := logf.Log.WithName("ScaledJobTest")
+	strategy := NewScalingStrategy(logger, getMockScaledJobWithStrategy("eager", "eager", 0, "0"))
+
+	maxScale, scaleTo := strategy.GetEffectiveMaxScale(4, 3, 0, 10, 1)
+	assert.Equal(t, int64(4), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
+	maxScale, scaleTo = strategy.GetEffectiveMaxScale(4, 0, 3, 10, 1)
+	assert.Equal(t, int64(4), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
+
+	maxScale, scaleTo = strategy.GetEffectiveMaxScale(4, 7, 0, 10, 1)
+	assert.Equal(t, int64(3), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
+	maxScale, scaleTo = strategy.GetEffectiveMaxScale(4, 1, 6, 10, 1)
+	assert.Equal(t, int64(3), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
+
+	maxScale, scaleTo = strategy.GetEffectiveMaxScale(15, 0, 0, 10, 1)
+	assert.Equal(t, int64(10), maxScale)
+	assert.Equal(t, int64(10), scaleTo)
 }
 
 func TestCleanUpMixedCaseWithSortByTime(t *testing.T) {
@@ -286,6 +316,64 @@ func TestGetPendingJobCount(t *testing.T) {
 	}
 }
 
+func TestCreateJobs(t *testing.T) {
+	ctx := context.Background()
+	logger := logf.Log.WithName("CreateJobsTest")
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	client := mock_client.NewMockClient(ctrl)
+	scaleExecutor := getMockScaleExecutor(client)
+
+	client.EXPECT().
+		Create(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(_ context.Context, obj runtime.Object, _ ...runtimeclient.CreateOption) {
+		j, ok := obj.(*batchv1.Job)
+		if !ok {
+			t.Error("Cast failed on batchv1.Job at mocking client.Create()")
+		}
+		if ok {
+			assert.Equal(t, "test-", j.ObjectMeta.GenerateName)
+			assert.Equal(t, "test", j.ObjectMeta.Namespace)
+		}
+	}).Times(2).
+		Return(nil)
+
+	scaledJob := getMockScaledJobWithDefaultStrategyAndMeta("test")
+	scaleExecutor.createJobs(ctx, logger, scaledJob, 2, 2)
+}
+
+func TestGenerateJobs(t *testing.T) {
+	var (
+		expectedAnnotations = map[string]string{
+			"test":                         "test",
+			"scaledjob.keda.sh/generation": "0",
+		}
+		expectedLabels = map[string]string{
+			"app.kubernetes.io/managed-by": "keda-operator",
+			"app.kubernetes.io/name":       "test",
+			"app.kubernetes.io/part-of":    "test",
+			"app.kubernetes.io/version":    "main",
+			"scaledjob.keda.sh/name":       "test",
+			"test":                         "test",
+		}
+	)
+
+	logger := logf.Log.WithName("GenerateJobsTest")
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	client := mock_client.NewMockClient(ctrl)
+	scaleExecutor := getMockScaleExecutor(client)
+	scaledJob := getMockScaledJobWithDefaultStrategyAndMeta("test")
+
+	jobs := scaleExecutor.generateJobs(logger, scaledJob, 2)
+
+	assert.Equal(t, 2, len(jobs))
+	for _, j := range jobs {
+		assert.Equal(t, expectedAnnotations, j.ObjectMeta.Annotations)
+		assert.Equal(t, expectedLabels, j.ObjectMeta.Labels)
+		assert.Equal(t, v1.RestartPolicyOnFailure, j.Spec.Template.Spec.RestartPolicy)
+	}
+}
+
 type mockJobParameter struct {
 	Name             string
 	CompletionTime   string
@@ -299,11 +387,15 @@ type pendingJobTestData struct {
 }
 
 func getMockScaleExecutor(client *mock_client.MockClient) *scaleExecutor {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(kedav1alpha1.AddToScheme(scheme))
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	return &scaleExecutor{
 		client:           client,
 		scaleClient:      nil,
-		reconcilerScheme: nil,
+		reconcilerScheme: scheme,
 		logger:           logf.Log.WithName("scaleexecutor"),
+		recorder:         record.NewFakeRecorder(1),
 	}
 }
 
@@ -367,10 +459,20 @@ func getMockScaledJobWithCustomStrategyWithNilParameter(name, scalingStrategy st
 
 func getMockScaledJobWithDefaultStrategy(name string) *kedav1alpha1.ScaledJob {
 	scaledJob := &kedav1alpha1.ScaledJob{
-		Spec: kedav1alpha1.ScaledJobSpec{},
+		Spec: kedav1alpha1.ScaledJobSpec{
+			JobTargetRef: &batchv1.JobSpec{},
+		},
 	}
 	scaledJob.ObjectMeta.Name = name
 	return scaledJob
+}
+
+func getMockScaledJobWithDefaultStrategyAndMeta(name string) *kedav1alpha1.ScaledJob {
+	sc := getMockScaledJobWithDefaultStrategy(name)
+	sc.ObjectMeta.Namespace = "test"
+	sc.ObjectMeta.Labels = map[string]string{"test": "test"}
+	sc.ObjectMeta.Annotations = map[string]string{"test": "test"}
+	return sc
 }
 
 func getMockScaledJobWithPendingPodConditions(pendingPodConditions []string) *kedav1alpha1.ScaledJob {

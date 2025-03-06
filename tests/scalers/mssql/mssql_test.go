@@ -9,6 +9,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -169,7 +170,7 @@ spec:
             command:
             - /bin/sh
             - -c
-            - "/opt/mssql-tools/bin/sqlcmd -S . -U sa -P '{{.MssqlPassword}}' -Q 'SELECT @@Version'"
+            - "/opt/mssql-tools18/bin/sqlcmd -S . -C -U sa -P '{{.MssqlPassword}}' -Q 'SELECT @@Version'"
 `
 
 	mssqlServiceTemplate = `apiVersion: v1
@@ -249,24 +250,28 @@ spec:
 func TestMssqlScaler(t *testing.T) {
 	// Create kubernetes resources for MS SQL server
 	kc := GetKubernetesClient(t)
-	data, mssqlTemplates := getMssqlTemplateData()
+	_, mssqlTemplates := getMssqlTemplateData()
+	_, templates := getTemplateData()
+	t.Cleanup(func() {
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
+
 	CreateKubernetesResources(t, kc, testNamespace, data, mssqlTemplates)
 
-	assert.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, mssqlServerName, testNamespace, 1, 60, 3),
+	require.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, mssqlServerName, testNamespace, 1, 60, 3),
 		"replica count should be %d after 3 minutes", 1)
 
-	createDatabaseCommand := fmt.Sprintf("/opt/mssql-tools/bin/sqlcmd -S . -U sa -P \"%s\" -Q \"CREATE DATABASE [%s]\"", mssqlPassword, mssqlDatabase)
+	createDatabaseCommand := fmt.Sprintf("/opt/mssql-tools18/bin/sqlcmd -S . -C -U sa -P \"%s\" -Q \"CREATE DATABASE [%s]\"", mssqlPassword, mssqlDatabase)
 
 	ok, out, errOut, err := WaitForSuccessfulExecCommandOnSpecificPod(t, mssqlServerPodName, testNamespace, createDatabaseCommand, 60, 3)
-	assert.True(t, ok, "executing a command on MS SQL Pod should work; Output: %s, ErrorOutput: %s, Error: %s", out, errOut, err)
+	require.True(t, ok, "executing a command on MS SQL Pod should work; Output: %s, ErrorOutput: %s, Error: %s", out, errOut, err)
 
-	createTableCommand := fmt.Sprintf("/opt/mssql-tools/bin/sqlcmd -S . -U sa -P \"%s\" -d %s -Q \"CREATE TABLE tasks ([id] int identity primary key, [status] varchar(10))\"",
+	createTableCommand := fmt.Sprintf("/opt/mssql-tools18/bin/sqlcmd -S . -C -U sa -P \"%s\" -d %s -Q \"CREATE TABLE tasks ([id] int identity primary key, [status] varchar(10))\"",
 		mssqlPassword, mssqlDatabase)
 	ok, out, errOut, err = WaitForSuccessfulExecCommandOnSpecificPod(t, mssqlServerPodName, testNamespace, createTableCommand, 60, 3)
-	assert.True(t, ok, "executing a command on MS SQL Pod should work; Output: %s, ErrorOutput: %s, Error: %s", out, errOut, err)
+	require.True(t, ok, "executing a command on MS SQL Pod should work; Output: %s, ErrorOutput: %s, Error: %s", out, errOut, err)
 
 	// Create kubernetes resources for testing
-	data, templates := getTemplateData()
 	KubectlApplyMultipleWithTemplate(t, data, templates)
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 3),
 		"replica count should be %d after 3 minutes", minReplicaCount)
@@ -274,15 +279,12 @@ func TestMssqlScaler(t *testing.T) {
 	testActivation(t, kc, data)
 	testScaleOut(t, kc, data)
 	testScaleIn(t, kc)
-
-	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
 }
 
 // insert 10 records in the table -> activation should not happen (activationTargetValue = 15)
 func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing activation ---")
-	KubectlApplyWithTemplate(t, data, "insertRecordsJobTemplate1", insertRecordsJobTemplate1)
+	KubectlReplaceWithTemplate(t, data, "insertRecordsJobTemplate1", insertRecordsJobTemplate1)
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
 }
@@ -290,7 +292,7 @@ func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 // insert another 10 records in the table, which in total is 20 -> should be scaled up
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale out ---")
-	KubectlApplyWithTemplate(t, data, "insertRecordsJobTemplate2", insertRecordsJobTemplate2)
+	KubectlReplaceWithTemplate(t, data, "insertRecordsJobTemplate2", insertRecordsJobTemplate2)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
 		"replica count should be %d after 3 minutes", maxReplicaCount)

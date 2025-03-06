@@ -2,22 +2,68 @@ package scalers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	libsSrv "github.com/dysnix/predictkube-libs/external/grpc/server"
 	pb "github.com/dysnix/predictkube-proto/external/proto/services"
 	"github.com/phayes/freeport"
+	prometheusV1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
+var apiStub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	if r.RequestURI == "/api/v1/status/runtimeinfo" {
+		w.WriteHeader(http.StatusOK)
+		runtimeInfo := prometheusV1.RuntimeinfoResult{
+			StartTime: time.Now(),
+		}
+		data, _ := json.Marshal(runtimeInfo)
+		response := struct {
+			Data json.RawMessage `json:"data"`
+		}{
+			Data: data,
+		}
+		_ = json.NewEncoder(w).Encode(response)
+		return
+	}
+	if r.RequestURI == "/api/v1/query_range" {
+		w.WriteHeader(http.StatusOK)
+		result := struct {
+			Type   model.ValueType `json:"resultType"`
+			Result interface{}     `json:"result"`
+		}{
+			Type: model.ValScalar,
+			Result: model.Scalar{
+				Value:     model.ZeroSamplePair.Value,
+				Timestamp: model.Now(),
+			},
+		}
+		data, _ := json.Marshal(result)
+		response := struct {
+			Data json.RawMessage `json:"data"`
+		}{
+			Data: data,
+		}
+		_ = json.NewEncoder(w).Encode(response)
+		return
+	}
+}))
+
 type server struct {
+	pb.UnimplementedMlEngineServiceServer
 	grpcSrv  *grpc.Server
 	listener net.Listener
 	port     int
@@ -113,7 +159,7 @@ type predictKubeMetadataTestData struct {
 var testPredictKubeMetadata = []predictKubeMetadataTestData{
 	// all properly formed
 	{
-		map[string]string{"predictHorizon": "2h", "historyTimeWindow": "7d", "prometheusAddress": "http://demo.robustperception.io:9090", "queryStep": "2m", "threshold": "2000", "query": "up"},
+		map[string]string{"predictHorizon": "2h", "historyTimeWindow": "7d", "prometheusAddress": apiStub.URL, "queryStep": "2m", "threshold": "2000", "query": "up"},
 		map[string]string{"apiKey": testAPIKey}, false,
 	},
 	// missing prometheusAddress
@@ -142,7 +188,7 @@ var testPredictKubeMetadata = []predictKubeMetadataTestData{
 
 func TestPredictKubeParseMetadata(t *testing.T) {
 	for _, testData := range testPredictKubeMetadata {
-		_, err := parsePredictKubeMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
+		_, err := parsePredictKubeMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
 		}
@@ -154,7 +200,7 @@ func TestPredictKubeParseMetadata(t *testing.T) {
 
 type predictKubeMetricIdentifier struct {
 	metadataTestData *predictKubeMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -175,10 +221,10 @@ func TestPredictKubeGetMetricSpecForScaling(t *testing.T) {
 
 	for _, testData := range predictKubeMetricIdentifiers {
 		mockPredictKubeScaler, err := NewPredictKubeScaler(
-			context.Background(), &ScalerConfig{
+			context.Background(), &scalersconfig.ScalerConfig{
 				TriggerMetadata: testData.metadataTestData.metadata,
 				AuthParams:      testData.metadataTestData.authParams,
-				ScalerIndex:     testData.scalerIndex,
+				TriggerIndex:    testData.triggerIndex,
 			},
 		)
 		assert.NoError(t, err)
@@ -209,10 +255,10 @@ func TestPredictKubeGetMetrics(t *testing.T) {
 
 	for _, testData := range predictKubeMetricIdentifiers {
 		mockPredictKubeScaler, err := NewPredictKubeScaler(
-			context.Background(), &ScalerConfig{
+			context.Background(), &scalersconfig.ScalerConfig{
 				TriggerMetadata: testData.metadataTestData.metadata,
 				AuthParams:      testData.metadataTestData.authParams,
-				ScalerIndex:     testData.scalerIndex,
+				TriggerIndex:    testData.triggerIndex,
 			},
 		)
 		assert.NoError(t, err)

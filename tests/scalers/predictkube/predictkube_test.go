@@ -210,12 +210,17 @@ spec:
 func TestScaler(t *testing.T) {
 	require.NotEmpty(t, predictkubeAPIKey, "PREDICTKUBE_API_KEY env variable is required for predictkube test")
 
-	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
-	prometheus.Install(t, kc, prometheusServerName, testNamespace)
+	data, templates := getTemplateData()
+	t.Cleanup(func() {
+		prometheus.Uninstall(t, prometheusServerName, testNamespace, nil)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
+
+	// Create kubernetes resources
+	prometheus.Install(t, kc, prometheusServerName, testNamespace, nil)
 
 	// Create kubernetes resources for testing
-	data, templates := getTemplateData()
 	KubectlApplyMultipleWithTemplate(t, data, templates)
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, monitoredAppName, testNamespace, 1, 60, 3),
 		"replica count should be %d after 3 minutes", minReplicaCount)
@@ -225,22 +230,18 @@ func TestScaler(t *testing.T) {
 	testActivation(t, kc, data)
 	testScaleOut(t, kc, data)
 	testScaleIn(t, kc)
-
-	// cleanup
-	KubectlDeleteMultipleWithTemplate(t, data, templates)
-	prometheus.Uninstall(t, kc, prometheusServerName, testNamespace)
 }
 
 func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing activation ---")
-	KubectlApplyWithTemplate(t, data, "generateLoadJobTemplate", generateLightLoadJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "generateLoadJobTemplate", generateLightLoadJobTemplate)
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
 }
 
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale out ---")
-	KubectlApplyWithTemplate(t, data, "generateLoadJobTemplate", generateHeavyLoadJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "generateLoadJobTemplate", generateHeavyLoadJobTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
 		"replica count should be %d after 3 minutes", maxReplicaCount)

@@ -18,26 +18,29 @@ package keda
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
+	eventingv1alpha1 "github.com/kedacore/keda/v2/apis/eventing/v1alpha1"
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	"github.com/kedacore/keda/v2/pkg/common/message"
+	"github.com/kedacore/keda/v2/pkg/eventemitter"
 	"github.com/kedacore/keda/v2/pkg/eventreason"
-	"github.com/kedacore/keda/v2/pkg/prommetrics"
+	"github.com/kedacore/keda/v2/pkg/metricscollector"
 )
 
 // ClusterTriggerAuthenticationReconciler reconciles a ClusterTriggerAuthentication object
 type ClusterTriggerAuthenticationReconciler struct {
 	client.Client
-	record.EventRecorder
+	eventemitter.EventHandler
 }
 
 type clusterTriggerAuthMetricsData struct {
@@ -54,7 +57,7 @@ func init() {
 	clusterTriggerAuthPromMetricsLock = &sync.Mutex{}
 }
 
-// +kubebuilder:rbac:groups=keda.sh,resources=clustertriggerauthentications;clustertriggerauthentications/status,verbs="*"
+// +kubebuilder:rbac:groups=keda.sh,resources=clustertriggerauthentications;clustertriggerauthentications/status,verbs=get;list;watch;update;patch
 
 // Reconcile performs reconciliation on the identified TriggerAuthentication resource based on the request information passed, returns the result and an error (if any).
 func (r *ClusterTriggerAuthenticationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -80,8 +83,12 @@ func (r *ClusterTriggerAuthenticationReconciler) Reconcile(ctx context.Context, 
 	r.updatePromMetrics(clusterTriggerAuthentication, req.NamespacedName.String())
 
 	if clusterTriggerAuthentication.ObjectMeta.Generation == 1 {
-		r.EventRecorder.Event(clusterTriggerAuthentication, corev1.EventTypeNormal, eventreason.ClusterTriggerAuthenticationAdded, "New ClusterTriggerAuthentication configured")
+		r.Emit(clusterTriggerAuthentication, req.NamespacedName.Namespace, corev1.EventTypeNormal, eventingv1alpha1.ClusterTriggerAuthenticationCreatedType, eventreason.ClusterTriggerAuthenticationAdded, message.ClusterTriggerAuthenticationCreatedMsg)
+	} else {
+		msg := fmt.Sprintf(message.ClusterTriggerAuthenticationUpdatedMsg, clusterTriggerAuthentication.Name)
+		r.Emit(clusterTriggerAuthentication, req.NamespacedName.Namespace, corev1.EventTypeNormal, eventingv1alpha1.ClusterTriggerAuthenticationUpdatedType, eventreason.ClusterTriggerAuthenticationUpdated, msg)
 	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -97,10 +104,10 @@ func (r *ClusterTriggerAuthenticationReconciler) updatePromMetrics(clusterTrigge
 	defer clusterTriggerAuthPromMetricsLock.Unlock()
 
 	if metricsData, ok := clusterTriggerAuthPromMetricsMap[namespacedName]; ok {
-		prommetrics.DecrementCRDTotal(prommetrics.ClusterTriggerAuthenticationResource, metricsData.namespace)
+		metricscollector.DecrementCRDTotal(metricscollector.ClusterTriggerAuthenticationResource, metricsData.namespace)
 	}
 
-	prommetrics.IncrementCRDTotal(prommetrics.ClusterTriggerAuthenticationResource, clusterTriggerAuth.Namespace)
+	metricscollector.IncrementCRDTotal(metricscollector.ClusterTriggerAuthenticationResource, clusterTriggerAuth.Namespace)
 	clusterTriggerAuthPromMetricsMap[namespacedName] = clusterTriggerAuthMetricsData{namespace: clusterTriggerAuth.Namespace}
 }
 
@@ -110,7 +117,7 @@ func (r *ClusterTriggerAuthenticationReconciler) UpdatePromMetricsOnDelete(names
 	defer clusterTriggerAuthPromMetricsLock.Unlock()
 
 	if metricsData, ok := clusterTriggerAuthPromMetricsMap[namespacedName]; ok {
-		prommetrics.DecrementCRDTotal(prommetrics.ClusterTriggerAuthenticationResource, metricsData.namespace)
+		metricscollector.DecrementCRDTotal(metricscollector.ClusterTriggerAuthenticationResource, metricsData.namespace)
 	}
 
 	delete(clusterTriggerAuthPromMetricsMap, namespacedName)

@@ -1,4 +1,4 @@
-name: e2e-tests
+name: E2E Test Creator
 on:
   pull_request_target:
     types:
@@ -9,12 +9,16 @@ env:
   SKIP_E2E_TAG: skip-e2e
   E2E_CHECK_NAME: e2e tests
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   check-creator:
     name: check-creator
     runs-on: ubuntu-latest
     steps:
-      - uses: LouisBrunner/checks-action@v1.5.0
+      - uses: LouisBrunner/checks-action@6b626ffbad7cc56fd58627f774b9067e6118af23 # v2
         name: Enqueue e2e
         id: create
         with:
@@ -23,7 +27,7 @@ jobs:
           name: ${{ env.E2E_CHECK_NAME }}
           status: queued
 
-      - uses: LouisBrunner/checks-action@v1.5.0
+      - uses: LouisBrunner/checks-action@6b626ffbad7cc56fd58627f774b9067e6118af23 # v2
         name: Skip e2e
         if: ${{ contains(github.event.pull_request.labels.*.name, env.SKIP_E2E_TAG )}}
         with:

@@ -2,62 +2,96 @@ package scalers
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/cloudwatch"
-	"github.com/aws/aws-sdk-go/service/cloudwatch/cloudwatchiface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/go-logr/logr"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
-	kedautil "github.com/kedacore/keda/v2/pkg/util"
-)
-
-const (
-	defaultMetricCollectionTime = 300
-	defaultMetricStat           = "Average"
-	defaultMetricStatPeriod     = 300
-	defaultMetricEndTimeOffset  = 0
+	awsutils "github.com/kedacore/keda/v2/pkg/scalers/aws"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type awsCloudwatchScaler struct {
 	metricType v2.MetricTargetType
 	metadata   *awsCloudwatchMetadata
-	cwClient   cloudwatchiface.CloudWatchAPI
+	cwClient   cloudwatch.GetMetricDataAPIClient
 	logger     logr.Logger
 }
 
 type awsCloudwatchMetadata struct {
-	namespace      string
-	metricsName    string
-	dimensionName  []string
-	dimensionValue []string
-	expression     string
+	awsAuthorization awsutils.AuthorizationMetadata
 
-	targetMetricValue           float64
-	activationTargetMetricValue float64
-	minMetricValue              float64
+	triggerIndex   int
+	Namespace      string   `keda:"name=namespace,      order=triggerMetadata, optional"`
+	MetricsName    string   `keda:"name=metricName,     order=triggerMetadata, optional"`
+	DimensionName  []string `keda:"name=dimensionName,  order=triggerMetadata, optional, separator=;"`
+	DimensionValue []string `keda:"name=dimensionValue, order=triggerMetadata, optional, separator=;"`
+	Expression     string   `keda:"name=expression,     order=triggerMetadata, optional"`
 
-	metricCollectionTime int64
-	metricStat           string
-	metricUnit           string
-	metricStatPeriod     int64
-	metricEndTimeOffset  int64
+	TargetMetricValue           float64 `keda:"name=targetMetricValue,           order=triggerMetadata"`
+	ActivationTargetMetricValue float64 `keda:"name=activationTargetMetricValue, order=triggerMetadata, optional"`
+	MinMetricValue              float64 `keda:"name=minMetricValue,              order=triggerMetadata"`
+	IgnoreNullValues            bool    `keda:"name=ignoreNullValues,            order=triggerMetadata, default=true"`
 
-	awsRegion   string
-	awsEndpoint string
+	MetricCollectionTime int64  `keda:"name=metricCollectionTime, order=triggerMetadata, default=300"`
+	MetricStat           string `keda:"name=metricStat,           order=triggerMetadata, default=Average"`
+	MetricUnit           string `keda:"name=metricUnit,           order=triggerMetadata, optional"` // Need to check the metric unit
+	MetricStatPeriod     int64  `keda:"name=metricStatPeriod,     order=triggerMetadata, default=300"`
+	MetricEndTimeOffset  int64  `keda:"name=metricEndTimeOffset,  order=triggerMetadata, default=0"`
 
-	awsAuthorization awsAuthorizationMetadata
+	AwsRegion   string `keda:"name=awsRegion,   order=triggerMetadata;authParams"`
+	AwsEndpoint string `keda:"name=awsEndpoint, order=triggerMetadata, optional"`
+}
 
-	scalerIndex int
+func (a *awsCloudwatchMetadata) Validate() error {
+	var err error
+	if a.Expression == "" {
+		if a.Namespace == "" {
+			return errors.New("namespace not given")
+		}
+
+		if a.MetricsName == "" {
+			return errors.New("metric name not given")
+		}
+
+		if a.DimensionName == nil {
+			return errors.New("dimension name not given")
+		}
+
+		if a.DimensionValue == nil {
+			return errors.New("dimension value not given")
+		}
+
+		if len(a.DimensionName) != len(a.DimensionValue) {
+			return errors.New("dimensionName and dimensionValue are not matching in size")
+		}
+
+		if err = checkMetricUnit(a.MetricUnit); err != nil {
+			return err
+		}
+	}
+
+	if err = checkMetricStat(a.MetricStat); err != nil {
+		return err
+	}
+	if err = checkMetricStatPeriod(a.MetricStatPeriod); err != nil {
+		return err
+	}
+	if a.MetricCollectionTime < 0 || a.MetricCollectionTime%a.MetricStatPeriod != 0 {
+		return fmt.Errorf("metricCollectionTime must be greater than 0 and a multiple of metricStatPeriod(%d), %d is given", a.MetricStatPeriod, a.MetricCollectionTime)
+	}
+
+	return nil
 }
 
 // NewAwsCloudwatchScaler creates a new awsCloudwatchScaler
-func NewAwsCloudwatchScaler(config *ScalerConfig) (Scaler, error) {
+func NewAwsCloudwatchScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -68,191 +102,67 @@ func NewAwsCloudwatchScaler(config *ScalerConfig) (Scaler, error) {
 		return nil, fmt.Errorf("error parsing cloudwatch metadata: %w", err)
 	}
 
+	cloudwatchClient, err := createCloudwatchClient(ctx, meta)
+	if err != nil {
+		return nil, fmt.Errorf("error creating cloudwatch client: %w", err)
+	}
 	return &awsCloudwatchScaler{
 		metricType: metricType,
 		metadata:   meta,
-		cwClient:   createCloudwatchClient(meta),
+		cwClient:   cloudwatchClient,
 		logger:     InitializeLogger(config, "aws_cloudwatch_scaler"),
 	}, nil
 }
 
-func getIntMetadataValue(metadata map[string]string, key string, required bool, defaultValue int64) (int64, error) {
-	if val, ok := metadata[key]; ok && val != "" {
-		value, err := strconv.Atoi(val)
-		if err != nil {
-			return 0, fmt.Errorf("error parsing %s metadata: %w", key, err)
+func createCloudwatchClient(ctx context.Context, metadata *awsCloudwatchMetadata) (*cloudwatch.Client, error) {
+	cfg, err := awsutils.GetAwsConfig(ctx, metadata.awsAuthorization)
+
+	if err != nil {
+		return nil, err
+	}
+	return cloudwatch.NewFromConfig(*cfg, func(options *cloudwatch.Options) {
+		if metadata.AwsEndpoint != "" {
+			options.BaseEndpoint = aws.String(metadata.AwsEndpoint)
 		}
-		return int64(value), nil
-	}
-
-	if required {
-		return 0, fmt.Errorf("metadata %s not given", key)
-	}
-
-	return defaultValue, nil
+	}), nil
 }
 
-func getFloatMetadataValue(metadata map[string]string, key string, required bool, defaultValue float64) (float64, error) {
-	if val, ok := metadata[key]; ok && val != "" {
-		value, err := strconv.ParseFloat(val, 64)
-		if err != nil {
-			return 0, fmt.Errorf("error parsing %s metadata: %w", key, err)
-		}
-		return value, nil
+func parseAwsCloudwatchMetadata(config *scalersconfig.ScalerConfig) (*awsCloudwatchMetadata, error) {
+	meta := &awsCloudwatchMetadata{}
+	if err := config.TypedConfig(meta); err != nil {
+		return nil, fmt.Errorf("error parsing prometheus metadata: %w", err)
 	}
 
-	if required {
-		return 0, fmt.Errorf("metadata %s not given", key)
-	}
-
-	return defaultValue, nil
-}
-
-func createCloudwatchClient(metadata *awsCloudwatchMetadata) *cloudwatch.CloudWatch {
-	sess, config := getAwsConfig(metadata.awsRegion,
-		metadata.awsEndpoint,
-		metadata.awsAuthorization)
-
-	return cloudwatch.New(sess, config)
-}
-
-func parseAwsCloudwatchMetadata(config *ScalerConfig) (*awsCloudwatchMetadata, error) {
-	var err error
-	meta := awsCloudwatchMetadata{}
-
-	if val, ok := config.TriggerMetadata["namespace"]; ok && val != "" {
-		meta.namespace = val
-	} else {
-		return nil, fmt.Errorf("namespace not given")
-	}
-
-	if val, ok := config.TriggerMetadata["metricName"]; ok && val != "" {
-		meta.metricsName = val
-	} else {
-		return nil, fmt.Errorf("metric name not given")
-	}
-
-	if config.TriggerMetadata["expression"] != "" {
-		if val, ok := config.TriggerMetadata["expression"]; ok && val != "" {
-			meta.expression = val
-		} else {
-			return nil, fmt.Errorf("expression not given")
-		}
-	} else {
-		if val, ok := config.TriggerMetadata["dimensionName"]; ok && val != "" {
-			meta.dimensionName = strings.Split(val, ";")
-		} else {
-			return nil, fmt.Errorf("dimension name not given")
-		}
-
-		if val, ok := config.TriggerMetadata["dimensionValue"]; ok && val != "" {
-			meta.dimensionValue = strings.Split(val, ";")
-		} else {
-			return nil, fmt.Errorf("dimension value not given")
-		}
-
-		if len(meta.dimensionName) != len(meta.dimensionValue) {
-			return nil, fmt.Errorf("dimensionName and dimensionValue are not matching in size")
-		}
-
-		meta.metricUnit = config.TriggerMetadata["metricUnit"]
-		if err = checkMetricUnit(meta.metricUnit); err != nil {
-			return nil, err
-		}
-	}
-
-	targetMetricValue, err := getFloatMetadataValue(config.TriggerMetadata, "targetMetricValue", true, 0)
-	if err != nil {
-		return nil, err
-	}
-	meta.targetMetricValue = targetMetricValue
-
-	activationTargetMetricValue, err := getFloatMetadataValue(config.TriggerMetadata, "activationTargetMetricValue", false, 0)
-	if err != nil {
-		return nil, err
-	}
-	meta.activationTargetMetricValue = activationTargetMetricValue
-
-	minMetricValue, err := getFloatMetadataValue(config.TriggerMetadata, "minMetricValue", true, 0)
-	if err != nil {
-		return nil, err
-	}
-	meta.minMetricValue = minMetricValue
-
-	meta.metricStat = defaultMetricStat
-	if val, ok := config.TriggerMetadata["metricStat"]; ok && val != "" {
-		meta.metricStat = val
-	}
-	if err = checkMetricStat(meta.metricStat); err != nil {
-		return nil, err
-	}
-
-	metricStatPeriod, err := getIntMetadataValue(config.TriggerMetadata, "metricStatPeriod", false, defaultMetricStatPeriod)
-	if err != nil {
-		return nil, err
-	}
-	meta.metricStatPeriod = metricStatPeriod
-
-	if err = checkMetricStatPeriod(meta.metricStatPeriod); err != nil {
-		return nil, err
-	}
-
-	metricCollectionTime, err := getIntMetadataValue(config.TriggerMetadata, "metricCollectionTime", false, defaultMetricCollectionTime)
-	if err != nil {
-		return nil, err
-	}
-	meta.metricCollectionTime = metricCollectionTime
-
-	if meta.metricCollectionTime < 0 || meta.metricCollectionTime%meta.metricStatPeriod != 0 {
-		return nil, fmt.Errorf("metricCollectionTime must be greater than 0 and a multiple of metricStatPeriod(%d), %d is given", meta.metricStatPeriod, meta.metricCollectionTime)
-	}
-
-	metricEndTimeOffset, err := getIntMetadataValue(config.TriggerMetadata, "metricEndTimeOffset", false, defaultMetricEndTimeOffset)
-	if err != nil {
-		return nil, err
-	}
-	meta.metricEndTimeOffset = metricEndTimeOffset
-
-	if val, ok := config.TriggerMetadata["awsRegion"]; ok && val != "" {
-		meta.awsRegion = val
-	} else {
-		return nil, fmt.Errorf("no awsRegion given")
-	}
-
-	if val, ok := config.TriggerMetadata["awsEndpoint"]; ok {
-		meta.awsEndpoint = val
-	}
-
-	awsAuthorization, err := getAwsAuthorization(config.AuthParams, config.TriggerMetadata, config.ResolvedEnv)
+	awsAuthorization, err := awsutils.GetAwsAuthorization(config.TriggerUniqueKey, meta.AwsRegion, config.PodIdentity, config.TriggerMetadata, config.AuthParams, config.ResolvedEnv)
 	if err != nil {
 		return nil, err
 	}
 	meta.awsAuthorization = awsAuthorization
 
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 
-	return &meta, nil
+	return meta, nil
 }
 
 func checkMetricStat(stat string) error {
-	for _, s := range cloudwatch.Statistic_Values() {
-		if stat == s {
+	for _, s := range types.Statistic("").Values() {
+		if s == types.Statistic(stat) {
 			return nil
 		}
 	}
-	return fmt.Errorf("metricStat '%s' is not one of %v", stat, cloudwatch.Statistic_Values())
+	return fmt.Errorf("metricStat '%s' is not one of %v", stat, types.Statistic("").Values())
 }
 
 func checkMetricUnit(unit string) error {
 	if unit == "" {
 		return nil
 	}
-	for _, u := range cloudwatch.StandardUnit_Values() {
-		if unit == u {
+	for _, s := range types.StandardUnit("").Values() {
+		if s == types.StandardUnit(unit) {
 			return nil
 		}
 	}
-	return fmt.Errorf("metricUnit '%s' is not one of %v", unit, cloudwatch.StandardUnit_Values())
+	return fmt.Errorf("metricUnit '%s' is not one of %v", unit, types.StandardUnit("").Values())
 }
 
 func checkMetricStatPeriod(period int64) error {
@@ -281,8 +191,7 @@ func computeQueryWindow(current time.Time, metricPeriodSec, metricEndTimeOffsetS
 }
 
 func (s *awsCloudwatchScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
-	metricValue, err := s.GetCloudwatchMetrics()
-
+	metricValue, err := s.GetCloudwatchMetrics(ctx)
 	if err != nil {
 		s.logger.Error(err, "Error getting metric value")
 		return []external_metrics.ExternalMetricValue{}, false, err
@@ -290,81 +199,73 @@ func (s *awsCloudwatchScaler) GetMetricsAndActivity(ctx context.Context, metricN
 
 	metric := GenerateMetricInMili(metricName, metricValue)
 
-	return []external_metrics.ExternalMetricValue{metric}, metricValue > s.metadata.activationTargetMetricValue, nil
+	return []external_metrics.ExternalMetricValue{metric}, metricValue > s.metadata.ActivationTargetMetricValue, nil
 }
 
 func (s *awsCloudwatchScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
-	var metricNameSuffix string
-
-	if s.metadata.expression != "" {
-		metricNameSuffix = s.metadata.metricsName
-	} else {
-		metricNameSuffix = s.metadata.dimensionName[0]
-	}
-
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("aws-cloudwatch-%s", metricNameSuffix))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, "aws-cloudwatch"),
 		},
-		Target: GetMetricTargetMili(s.metricType, s.metadata.targetMetricValue),
+		Target: GetMetricTargetMili(s.metricType, s.metadata.TargetMetricValue),
 	}
 	metricSpec := v2.MetricSpec{External: externalMetric, Type: externalMetricType}
 	return []v2.MetricSpec{metricSpec}
 }
 
 func (s *awsCloudwatchScaler) Close(context.Context) error {
+	awsutils.ClearAwsConfig(s.metadata.awsAuthorization)
 	return nil
 }
 
-func (s *awsCloudwatchScaler) GetCloudwatchMetrics() (float64, error) {
+func (s *awsCloudwatchScaler) GetCloudwatchMetrics(ctx context.Context) (float64, error) {
 	var input cloudwatch.GetMetricDataInput
 
-	startTime, endTime := computeQueryWindow(time.Now(), s.metadata.metricStatPeriod, s.metadata.metricEndTimeOffset, s.metadata.metricCollectionTime)
+	startTime, endTime := computeQueryWindow(time.Now(), s.metadata.MetricStatPeriod, s.metadata.MetricEndTimeOffset, s.metadata.MetricCollectionTime)
 
-	if s.metadata.expression != "" {
+	if s.metadata.Expression != "" {
 		input = cloudwatch.GetMetricDataInput{
 			StartTime: aws.Time(startTime),
 			EndTime:   aws.Time(endTime),
-			ScanBy:    aws.String(cloudwatch.ScanByTimestampDescending),
-			MetricDataQueries: []*cloudwatch.MetricDataQuery{
+			ScanBy:    types.ScanByTimestampDescending,
+			MetricDataQueries: []types.MetricDataQuery{
 				{
-					Expression: aws.String(s.metadata.expression),
+					Expression: aws.String(s.metadata.Expression),
 					Id:         aws.String("q1"),
-					Period:     aws.Int64(s.metadata.metricStatPeriod),
-					Label:      aws.String(s.metadata.metricsName),
+					Period:     aws.Int32(int32(s.metadata.MetricStatPeriod)),
 				},
 			},
 		}
 	} else {
-		dimensions := []*cloudwatch.Dimension{}
-		for i := range s.metadata.dimensionName {
-			dimensions = append(dimensions, &cloudwatch.Dimension{
-				Name:  &s.metadata.dimensionName[i],
-				Value: &s.metadata.dimensionValue[i],
+		var dimensions []types.Dimension
+		for i := range s.metadata.DimensionName {
+			dimensions = append(dimensions, types.Dimension{
+				Name:  &s.metadata.DimensionName[i],
+				Value: &s.metadata.DimensionValue[i],
 			})
 		}
 
-		var metricUnit *string
-		if s.metadata.metricUnit != "" {
-			metricUnit = aws.String(s.metadata.metricUnit)
+		var metricUnit string
+		if s.metadata.MetricUnit != "" {
+			metricUnit = s.metadata.MetricUnit
 		}
 
 		input = cloudwatch.GetMetricDataInput{
 			StartTime: aws.Time(startTime),
 			EndTime:   aws.Time(endTime),
-			ScanBy:    aws.String(cloudwatch.ScanByTimestampDescending),
-			MetricDataQueries: []*cloudwatch.MetricDataQuery{
+			ScanBy:    types.ScanByTimestampDescending,
+			MetricDataQueries: []types.MetricDataQuery{
 				{
 					Id: aws.String("c1"),
-					MetricStat: &cloudwatch.MetricStat{
-						Metric: &cloudwatch.Metric{
-							Namespace:  aws.String(s.metadata.namespace),
+					MetricStat: &types.MetricStat{
+						Metric: &types.Metric{
+							Namespace:  aws.String(s.metadata.Namespace),
 							Dimensions: dimensions,
-							MetricName: aws.String(s.metadata.metricsName),
+							MetricName: aws.String(s.metadata.MetricsName),
 						},
-						Period: aws.Int64(s.metadata.metricStatPeriod),
-						Stat:   aws.String(s.metadata.metricStat),
-						Unit:   metricUnit,
+						Period: aws.Int32(int32(s.metadata.MetricStatPeriod)),
+						Stat:   aws.String(s.metadata.MetricStat),
+						Unit:   types.StandardUnit(metricUnit),
 					},
 					ReturnData: aws.Bool(true),
 				},
@@ -372,21 +273,29 @@ func (s *awsCloudwatchScaler) GetCloudwatchMetrics() (float64, error) {
 		}
 	}
 
-	output, err := s.cwClient.GetMetricData(&input)
-
+	output, err := s.cwClient.GetMetricData(ctx, &input)
 	if err != nil {
 		s.logger.Error(err, "Failed to get output")
 		return -1, err
 	}
 
 	s.logger.V(1).Info("Received Metric Data", "data", output)
-	var metricValue float64
-	if len(output.MetricDataResults) > 0 && len(output.MetricDataResults[0].Values) > 0 {
-		metricValue = *output.MetricDataResults[0].Values[0]
-	} else {
-		s.logger.Info("empty metric data received, returning minMetricValue")
-		metricValue = s.metadata.minMetricValue
+
+	// If no metric data results or the first result has no values, and ignoreNullValues is false,
+	// the scaler should return an error to prevent any further scaling actions.
+	if len(output.MetricDataResults) > 0 && len(output.MetricDataResults[0].Values) == 0 && !s.metadata.IgnoreNullValues {
+		emptyMetricsErrMsg := "empty metric data received, ignoreNullValues is false, returning error"
+		s.logger.Error(nil, emptyMetricsErrMsg)
+		return -1, fmt.Errorf("%s", emptyMetricsErrMsg)
 	}
 
+	var metricValue float64
+
+	if len(output.MetricDataResults) > 0 && len(output.MetricDataResults[0].Values) > 0 {
+		metricValue = output.MetricDataResults[0].Values[0]
+	} else {
+		s.logger.Info("empty metric data received, returning minMetricValue")
+		metricValue = s.metadata.MinMetricValue
+	}
 	return metricValue, nil
 }

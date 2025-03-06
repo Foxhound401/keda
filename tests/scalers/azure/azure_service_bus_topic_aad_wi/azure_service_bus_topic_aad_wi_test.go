@@ -80,7 +80,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: nginx:1.16.1
+          image: nginxinc/nginx-unprivileged
 `
 
 	triggerAuthTemplate = `
@@ -143,7 +143,7 @@ func TestScaler(t *testing.T) {
 	testScaleIn(t, kc, adminClient)
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 	cleanupServiceBusTopic(t, adminClient)
 }
 

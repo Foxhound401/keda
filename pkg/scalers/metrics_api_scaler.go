@@ -2,6 +2,7 @@ package scalers
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -11,19 +12,23 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/tidwall/gjson"
+	"gopkg.in/yaml.v3"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
 	"github.com/kedacore/keda/v2/pkg/scalers/authentication"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
 type metricsAPIScaler struct {
 	metricType v2.MetricTargetType
 	metadata   *metricsAPIScalerMetadata
-	client     *http.Client
+	httpClient *http.Client
 	logger     logr.Logger
 }
 
@@ -31,6 +36,7 @@ type metricsAPIScalerMetadata struct {
 	targetValue           float64
 	activationTargetValue float64
 	url                   string
+	format                APIFormat
 	valueLocation         string
 	unsafeSsl             bool
 
@@ -57,15 +63,35 @@ type metricsAPIScalerMetadata struct {
 	enableBearerAuth bool
 	bearerToken      string
 
-	scalerIndex int
+	triggerIndex int
 }
 
 const (
-	methodValueQuery = "query"
+	methodValueQuery           = "query"
+	valueLocationWrongErrorMsg = "valueLocation must point to value of type number or a string representing a Quantity got: '%s'"
+)
+
+type APIFormat string
+
+// Options for APIFormat:
+const (
+	PrometheusFormat APIFormat = "prometheus"
+	JSONFormat       APIFormat = "json"
+	XMLFormat        APIFormat = "xml"
+	YAMLFormat       APIFormat = "yaml"
+)
+
+var (
+	supportedFormats = []APIFormat{
+		PrometheusFormat,
+		JSONFormat,
+		XMLFormat,
+		YAMLFormat,
+	}
 )
 
 // NewMetricsAPIScaler creates a new HTTP scaler
-func NewMetricsAPIScaler(config *ScalerConfig) (Scaler, error) {
+func NewMetricsAPIScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -79,24 +105,24 @@ func NewMetricsAPIScaler(config *ScalerConfig) (Scaler, error) {
 	httpClient := kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, meta.unsafeSsl)
 
 	if meta.enableTLS || len(meta.ca) > 0 {
-		config, err := kedautil.NewTLSConfig(meta.cert, meta.key, meta.ca)
+		config, err := kedautil.NewTLSConfig(meta.cert, meta.key, meta.ca, meta.unsafeSsl)
 		if err != nil {
 			return nil, err
 		}
-		httpClient.Transport = &http.Transport{TLSClientConfig: config}
+		httpClient.Transport = kedautil.CreateHTTPTransportWithTLSConfig(config)
 	}
 
 	return &metricsAPIScaler{
 		metricType: metricType,
 		metadata:   meta,
-		client:     httpClient,
+		httpClient: httpClient,
 		logger:     InitializeLogger(config, "metrics_api_scaler"),
 	}, nil
 }
 
-func parseMetricsAPIMetadata(config *ScalerConfig) (*metricsAPIScalerMetadata, error) {
+func parseMetricsAPIMetadata(config *scalersconfig.ScalerConfig) (*metricsAPIScalerMetadata, error) {
 	meta := metricsAPIScalerMetadata{}
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 
 	meta.unsafeSsl = false
 	if val, ok := config.TriggerMetadata["unsafeSsl"]; ok {
@@ -114,7 +140,11 @@ func parseMetricsAPIMetadata(config *ScalerConfig) (*metricsAPIScalerMetadata, e
 		}
 		meta.targetValue = targetValue
 	} else {
-		return nil, fmt.Errorf("no targetValue given in metadata")
+		if config.AsMetricSource {
+			meta.targetValue = 0
+		} else {
+			return nil, fmt.Errorf("no targetValue given in metadata")
+		}
 	}
 
 	meta.activationTargetValue = 0
@@ -130,6 +160,16 @@ func parseMetricsAPIMetadata(config *ScalerConfig) (*metricsAPIScalerMetadata, e
 		meta.url = val
 	} else {
 		return nil, fmt.Errorf("no url given in metadata")
+	}
+
+	if val, ok := config.TriggerMetadata["format"]; ok {
+		meta.format = APIFormat(strings.TrimSpace(val))
+		if !kedautil.Contains(supportedFormats, meta.format) {
+			return nil, fmt.Errorf("format %s not supported", meta.format)
+		}
+	} else {
+		// default format is JSON for backward compatibility
+		meta.format = JSONFormat
 	}
 
 	if val, ok := config.TriggerMetadata["valueLocation"]; ok {
@@ -206,21 +246,166 @@ func parseMetricsAPIMetadata(config *ScalerConfig) (*metricsAPIScalerMetadata, e
 	return &meta, nil
 }
 
-// GetValueFromResponse uses provided valueLocation to access the numeric value in provided body
-func GetValueFromResponse(body []byte, valueLocation string) (float64, error) {
+// GetValueFromResponse uses provided valueLocation to access the numeric value in provided body using the format specified.
+func GetValueFromResponse(body []byte, valueLocation string, format APIFormat) (float64, error) {
+	switch format {
+	case PrometheusFormat:
+		return getValueFromPrometheusResponse(body, valueLocation)
+	case JSONFormat:
+		return getValueFromJSONResponse(body, valueLocation)
+	case XMLFormat:
+		return getValueFromXMLResponse(body, valueLocation)
+	case YAMLFormat:
+		return getValueFromYAMLResponse(body, valueLocation)
+	}
+
+	return 0, fmt.Errorf("format %s not supported", format)
+}
+
+// getValueFromPrometheusResponse uses provided valueLocation to access the numeric value in provided body
+func getValueFromPrometheusResponse(body []byte, valueLocation string) (float64, error) {
+	matchers, err := parser.ParseMetricSelector(valueLocation)
+	if err != nil {
+		return 0, err
+	}
+	metricName := ""
+	for _, v := range matchers {
+		if v.Name == "__name__" {
+			metricName = v.Value
+		}
+	}
+	// Ensure EOL
+	reader := strings.NewReader(strings.ReplaceAll(string(body), "\r\n", "\n"))
+	familiesParser := expfmt.TextParser{}
+	families, err := familiesParser.TextToMetricFamilies(reader)
+	if err != nil {
+		return 0, err
+	}
+	family, ok := families[metricName]
+	if !ok {
+		return 0, fmt.Errorf("metric '%s' not found", metricName)
+	}
+
+	metrics := family.GetMetric()
+	for _, metric := range metrics {
+		labels := metric.GetLabel()
+		match := true
+		for _, matcher := range matchers {
+			matcherFound := false
+			if matcher == nil {
+				continue
+			}
+			// The name has been already validated,
+			// so we can skip it and check the other labels
+			if matcher.Name == "__name__" {
+				continue
+			}
+			for _, label := range labels {
+				if *label.Name == matcher.Name &&
+					*label.Value == matcher.Value {
+					matcherFound = true
+				}
+			}
+			if !matcherFound {
+				match = false
+			}
+		}
+		if match {
+			untyped := metric.GetUntyped()
+			if untyped != nil && untyped.Value != nil {
+				return *untyped.Value, nil
+			}
+			counter := metric.GetCounter()
+			if counter != nil && counter.Value != nil {
+				return *counter.Value, nil
+			}
+			gauge := metric.GetGauge()
+			if gauge != nil && gauge.Value != nil {
+				return *gauge.Value, nil
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("value %s not found", valueLocation)
+}
+
+// getValueFromJSONResponse uses provided valueLocation to access the numeric value in provided body using GJSON
+func getValueFromJSONResponse(body []byte, valueLocation string) (float64, error) {
 	r := gjson.GetBytes(body, valueLocation)
-	errorMsg := "valueLocation must point to value of type number or a string representing a Quantity got: '%s'"
 	if r.Type == gjson.String {
 		v, err := resource.ParseQuantity(r.String())
 		if err != nil {
-			return 0, fmt.Errorf(errorMsg, r.String())
+			return 0, fmt.Errorf(valueLocationWrongErrorMsg, r.String())
 		}
 		return v.AsApproximateFloat64(), nil
 	}
 	if r.Type != gjson.Number {
-		return 0, fmt.Errorf(errorMsg, r.Type.String())
+		return 0, fmt.Errorf(valueLocationWrongErrorMsg, r.Type.String())
 	}
 	return r.Num, nil
+}
+
+// getValueFromXMLResponse uses provided valueLocation to access the numeric value in provided body
+func getValueFromXMLResponse(body []byte, valueLocation string) (float64, error) {
+	var xmlMap map[string]interface{}
+	err := xml.Unmarshal(body, &xmlMap)
+	if err != nil {
+		return 0, err
+	}
+
+	path, err := kedautil.GetValueByPath(xmlMap, valueLocation)
+	if err != nil {
+		return 0, err
+	}
+
+	switch v := path.(type) {
+	case int:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	case string:
+		r, err := resource.ParseQuantity(v)
+		if err != nil {
+			return 0, fmt.Errorf(valueLocationWrongErrorMsg, v)
+		}
+		return r.AsApproximateFloat64(), nil
+	default:
+		return 0, fmt.Errorf(valueLocationWrongErrorMsg, v)
+	}
+}
+
+// getValueFromYAMLResponse uses provided valueLocation to access the numeric value in provided body
+// using generic ketautil.GetValueByPath
+func getValueFromYAMLResponse(body []byte, valueLocation string) (float64, error) {
+	var yamlMap map[string]interface{}
+	err := yaml.Unmarshal(body, &yamlMap)
+	if err != nil {
+		return 0, err
+	}
+
+	path, err := kedautil.GetValueByPath(yamlMap, valueLocation)
+	if err != nil {
+		return 0, err
+	}
+
+	switch v := path.(type) {
+	case int:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	case string:
+		r, err := resource.ParseQuantity(v)
+		if err != nil {
+			return 0, fmt.Errorf(valueLocationWrongErrorMsg, v)
+		}
+		return r.AsApproximateFloat64(), nil
+	default:
+		return 0, fmt.Errorf(valueLocationWrongErrorMsg, v)
+	}
 }
 
 func (s *metricsAPIScaler) getMetricValue(ctx context.Context) (float64, error) {
@@ -229,7 +414,7 @@ func (s *metricsAPIScaler) getMetricValue(ctx context.Context) (float64, error) 
 		return 0, err
 	}
 
-	r, err := s.client.Do(request)
+	r, err := s.httpClient.Do(request)
 	if err != nil {
 		return 0, err
 	}
@@ -244,7 +429,7 @@ func (s *metricsAPIScaler) getMetricValue(ctx context.Context) (float64, error) 
 	if err != nil {
 		return 0, err
 	}
-	v, err := GetValueFromResponse(b, s.metadata.valueLocation)
+	v, err := GetValueFromResponse(b, s.metadata.valueLocation, s.metadata.format)
 	if err != nil {
 		return 0, err
 	}
@@ -253,6 +438,9 @@ func (s *metricsAPIScaler) getMetricValue(ctx context.Context) (float64, error) 
 
 // Close does nothing in case of metricsAPIScaler
 func (s *metricsAPIScaler) Close(context.Context) error {
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }
 
@@ -260,7 +448,7 @@ func (s *metricsAPIScaler) Close(context.Context) error {
 func (s *metricsAPIScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("metric-api-%s", s.metadata.valueLocation))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(fmt.Sprintf("metric-api-%s", s.metadata.valueLocation))),
 		},
 		Target: GetMetricTargetMili(s.metricType, s.metadata.targetValue),
 	}

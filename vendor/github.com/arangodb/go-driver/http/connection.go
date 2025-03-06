@@ -1,7 +1,7 @@
 //
 // DISCLAIMER
 //
-// Copyright 2017 ArangoDB GmbH, Cologne, Germany
+// Copyright 2023 ArangoDB GmbH, Cologne, Germany
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,6 @@
 //
 // Copyright holder is ArangoDB GmbH, Cologne, Germany
 //
-// Author Ewout Prangsma
-//
 
 package http
 
@@ -28,7 +26,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -56,6 +54,8 @@ const (
 type ConnectionConfig struct {
 	// Endpoints holds 1 or more URL's used to connect to the database.
 	// In case of a connection to an ArangoDB cluster, you must provide the URL's of all coordinators.
+	// If there is more than one endpoint, the client will pick the first one that works and use it till it fails.
+	// Then it will try the next one
 	Endpoints []string
 	// TLSConfig holds settings used to configure a TLS (HTTPS) connection.
 	// This is only used for endpoints using the HTTPS scheme.
@@ -204,18 +204,12 @@ func (c *httpConnection) NewRequest(method, path string) (driver.Request, error)
 		return nil, driver.WithStack(driver.InvalidArgumentError{Message: fmt.Sprintf("Invalid method '%s'", method)})
 	}
 
-	ct := c.contentType
-	if ct != driver.ContentTypeJSON && strings.Contains(path, "_api/gharial") {
-		// Currently (3.1.18) calls to this API do not work well with vpack.
-		ct = driver.ContentTypeJSON
-	}
-
 	r := &httpRequest{
 		method: method,
 		path:   path,
 	}
 
-	switch ct {
+	switch c.contentType {
 	case driver.ContentTypeJSON:
 		r.bodyBuilder = NewJsonBodyBuilder()
 		return r, nil
@@ -234,6 +228,8 @@ func (c *httpConnection) Do(ctx context.Context, req driver.Request) (driver.Res
 	if !ok {
 		return nil, driver.WithStack(driver.InvalidArgumentError{Message: "request is not a httpRequest type"})
 	}
+
+	driver.ApplyVersionHeader(ctx, req)
 
 	r, err := request.createHTTPRequest(c.endpoint)
 	rctx := ctx
@@ -334,7 +330,7 @@ func readBody(resp *http.Response) ([]byte, error) {
 	contentLength := resp.ContentLength
 	if contentLength < 0 {
 		// Don't know the content length, do it the slowest way
-		result, err := ioutil.ReadAll(resp.Body)
+		result, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return nil, driver.WithStack(err)
 		}
@@ -389,7 +385,7 @@ func (c *httpConnection) UpdateEndpoints(endpoints []string) error {
 	return nil
 }
 
-// Configure the authentication used for this connection.
+// SetAuthentication creates a copy of connection wrapper for given auth parameters.
 func (c *httpConnection) SetAuthentication(auth driver.Authentication) (driver.Connection, error) {
 	var httpAuth httpAuthentication
 	switch auth.Type() {
@@ -471,8 +467,8 @@ func (h *RepeatConnection) UpdateEndpoints(endpoints []string) error {
 	return h.conn.UpdateEndpoints(endpoints)
 }
 
-// Configure the authentication used for this connection.
-// Returns ErrAuthenticationNotChanged in when the authentication is not changed.
+// SetAuthentication configure the authentication used for this connection.
+// Returns ErrAuthenticationNotChanged when the authentication is not changed.
 func (h *RepeatConnection) SetAuthentication(authentication driver.Authentication) (driver.Connection, error) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
@@ -481,16 +477,17 @@ func (h *RepeatConnection) SetAuthentication(authentication driver.Authenticatio
 		return h, ErrAuthenticationNotChanged
 	}
 
-	_, err := h.conn.SetAuthentication(authentication)
+	newConn, err := h.conn.SetAuthentication(authentication)
 	if err != nil {
 		return nil, driver.WithStack(err)
 	}
+	h.conn = newConn
 	h.auth = authentication
 
 	return h, nil
 }
 
 // Protocols returns all protocols used by this connection.
-func (h RepeatConnection) Protocols() driver.ProtocolSet {
+func (h *RepeatConnection) Protocols() driver.ProtocolSet {
 	return h.conn.Protocols()
 }

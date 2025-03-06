@@ -51,7 +51,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: 'nginx'`
+          image: 'nginxinc/nginx-unprivileged'`
 
 	sutDeploymentTemplate = `apiVersion: apps/v1
 kind: Deployment
@@ -72,7 +72,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: 'nginx'`
+        image: 'nginxinc/nginx-unprivileged'`
 
 	scaledObjectTemplate = `apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
@@ -119,7 +119,7 @@ func TestScaler(t *testing.T) {
 	testScaleIn(t, kc)
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 }
 
 func testActivation(t *testing.T, kc *kubernetes.Clientset) {

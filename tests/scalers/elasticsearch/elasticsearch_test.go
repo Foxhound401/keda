@@ -13,6 +13,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -80,7 +81,7 @@ metadata:
   labels:
     app: {{.DeploymentName}}
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: {{.DeploymentName}}
@@ -91,7 +92,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginx:1.14.2
+        image: nginxinc/nginx-unprivileged
         ports:
         - containerPort: 80
 `
@@ -170,7 +171,6 @@ spec:
         - containerPort: 9300
           name: transport
           protocol: TCP
-        resources:
         readinessProbe:
           exec:
             command:
@@ -202,7 +202,7 @@ spec:
     name: elasticsearch
 `
 
-	scaledObjectTemplate = `
+	scaledObjectTemplateSearchTemplate = `
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -228,6 +228,54 @@ spec:
         targetValue: "1"
         activationTargetValue: "4"
         parameters: "dummy_value:1;dumb_value:oOooo"
+      authenticationRef:
+        name: keda-trigger-auth-elasticsearch-secret
+`
+
+	scaledObjectTemplateQuery = `
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{.ScaledObjectName}}
+  namespace: {{.TestNamespace}}
+  labels:
+    app: {{.DeploymentName}}
+spec:
+  scaleTargetRef:
+    name: {{.DeploymentName}}
+  minReplicaCount: 0
+  maxReplicaCount: 2
+  pollingInterval: 3
+  cooldownPeriod:  5
+  triggers:
+    - type: elasticsearch
+      metadata:
+        addresses: "http://{{.DeploymentName}}.{{.TestNamespace}}.svc:9200"
+        username: "elastic"
+        index: {{.IndexName}}
+        query: |
+          {
+            "query": {
+              "bool": {
+                "must": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-1m",
+                        "lte": "now"
+                      }
+                    }
+                  },
+                  {
+                    "match_all": {}
+                  }
+                ]
+              }
+            }
+          }
+        valueLocation: "hits.total.value"
+        targetValue: "1"
+        activationTargetValue: "4"
       authenticationRef:
         name: keda-trigger-auth-elasticsearch-secret
 `
@@ -295,52 +343,65 @@ spec:
 )
 
 func TestElasticsearchScaler(t *testing.T) {
-	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
 	data, templates := getTemplateData()
+
+	// Create kubernetes resources
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
 	// setup elastic
 	setupElasticsearch(t, kc)
 
-	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 3),
-		"replica count should be %d after 3 minutes", minReplicaCount)
+	t.Run("test with searchTemplateName", func(t *testing.T) {
+		t.Log("--- testing with searchTemplateName ---")
 
-	// test scaling
-	testActivation(t, kc)
-	testScaleOut(t, kc)
-	testScaleIn(t, kc)
+		// Create ScaledObject with searchTemplateName
+		KubectlApplyWithTemplate(t, data, "scaledObjectTemplateSearchTemplate", scaledObjectTemplateSearchTemplate)
+
+		testElasticsearchScaler(t, kc)
+
+		// Delete ScaledObject
+		KubectlDeleteWithTemplate(t, data, "scaledObjectTemplateSearchTemplate", scaledObjectTemplateSearchTemplate)
+	})
+
+	t.Run("test with query", func(t *testing.T) {
+		t.Log("--- testing with query ---")
+
+		// Create ScaledObject with query
+		KubectlApplyWithTemplate(t, data, "scaledObjectTemplateQuery", scaledObjectTemplateQuery)
+
+		testElasticsearchScaler(t, kc)
+
+		// Delete ScaledObject
+		KubectlDeleteWithTemplate(t, data, "scaledObjectTemplateQuery", scaledObjectTemplateQuery)
+	})
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 }
 
 func setupElasticsearch(t *testing.T, kc *kubernetes.Clientset) {
-	assert.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, "elasticsearch", testNamespace, 1, 60, 3),
+	require.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, "elasticsearch", testNamespace, 1, 60, 3),
 		"elasticsearch should be up")
 	// Create the index and the search template
 	_, err := ExecuteCommand(fmt.Sprintf("%s -XPUT http://localhost:9200/%s -d '%s'", kubectlElasticExecCmd, indexName, elasticsearchCreateIndex))
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 	_, err = ExecuteCommand(fmt.Sprintf("%s -XPUT http://localhost:9200/_scripts/%s -d '%s'", kubectlElasticExecCmd, searchTemplateName, elasticsearchSearchTemplate))
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 }
 
-func testActivation(t *testing.T, kc *kubernetes.Clientset) {
+func testElasticsearchScaler(t *testing.T, kc *kubernetes.Clientset) {
 	t.Log("--- testing activation ---")
 	addElements(t, 3)
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
-}
 
-func testScaleOut(t *testing.T, kc *kubernetes.Clientset) {
 	t.Log("--- testing scale out ---")
-	addElements(t, 5)
+	addElements(t, 10)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
 		"replica count should be %d after 3 minutes", maxReplicaCount)
-}
 
-func testScaleIn(t *testing.T, kc *kubernetes.Clientset) {
 	t.Log("--- testing scale in ---")
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 3),
@@ -382,6 +443,5 @@ func getTemplateData() (templateData, []Template) {
 			{Name: "serviceTemplate", Config: serviceTemplate},
 			{Name: "elasticsearchDeploymentTemplate", Config: elasticsearchDeploymentTemplate},
 			{Name: "deploymentTemplate", Config: deploymentTemplate},
-			{Name: "scaledObjectTemplate", Config: scaledObjectTemplate},
 		}
 }

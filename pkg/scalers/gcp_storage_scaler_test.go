@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 var testGcsResolvedEnv = map[string]string{
@@ -19,7 +21,7 @@ type parseGcsMetadataTestData struct {
 
 type gcpGcsMetricIdentifier struct {
 	metadataTestData *parseGcsMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -40,9 +42,9 @@ var testGcsMetadata = []parseGcsMetadataTestData{
 	// malformed activationTargetObjectCount
 	{nil, map[string]string{"bucketName": "test-bucket", "credentialsFromEnv": "SAMPLE_CREDS", "activationTargetObjectCount": "A"}, true},
 	// Credentials from AuthParams
-	{map[string]string{"GoogleApplicationCredentials": "Creds", "podIdentityOwner": ""}, map[string]string{"bucketName": "test-bucket", "targetLength": "7"}, false},
+	{map[string]string{"GoogleApplicationCredentials": "Creds"}, map[string]string{"bucketName": "test-bucket", "targetLength": "7"}, false},
 	// Credentials from AuthParams with empty creds
-	{map[string]string{"GoogleApplicationCredentials": "", "podIdentityOwner": ""}, map[string]string{"bucketName": "test-bucket", "subscriptionSize": "7"}, true},
+	{map[string]string{"GoogleApplicationCredentials": ""}, map[string]string{"bucketName": "test-bucket", "subscriptionSize": "7"}, true},
 }
 
 var gcpGcsMetricIdentifiers = []gcpGcsMetricIdentifier{
@@ -52,7 +54,7 @@ var gcpGcsMetricIdentifiers = []gcpGcsMetricIdentifier{
 
 func TestGcsParseMetadata(t *testing.T) {
 	for _, testData := range testGcsMetadata {
-		_, err := parseGcsMetadata(&ScalerConfig{AuthParams: testData.authParams, TriggerMetadata: testData.metadata, ResolvedEnv: testGcsResolvedEnv}, logr.Discard())
+		_, err := parseGcsMetadata(&scalersconfig.ScalerConfig{AuthParams: testData.authParams, TriggerMetadata: testData.metadata, ResolvedEnv: testGcsResolvedEnv}, logr.Discard())
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
 		}
@@ -64,7 +66,7 @@ func TestGcsParseMetadata(t *testing.T) {
 
 func TestGcsGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range gcpGcsMetricIdentifiers {
-		meta, err := parseGcsMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ResolvedEnv: testGcsResolvedEnv, ScalerIndex: testData.scalerIndex}, logr.Discard())
+		meta, err := parseGcsMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ResolvedEnv: testGcsResolvedEnv, TriggerIndex: testData.triggerIndex}, logr.Discard())
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}

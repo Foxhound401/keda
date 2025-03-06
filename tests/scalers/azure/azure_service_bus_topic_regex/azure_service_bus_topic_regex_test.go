@@ -80,7 +80,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: nginx:1.16.1
+          image: nginxinc/nginx-unprivileged
 `
 
 	triggerAuthTemplate = `
@@ -148,7 +148,7 @@ func TestScaler(t *testing.T) {
 	testScale(t, kc, client, data)
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 	cleanupServiceBusTopic(t, adminClient, topicName)
 }
 
@@ -225,8 +225,8 @@ func testScale(t *testing.T, kc *kubernetes.Clientset, client *azservicebus.Clie
 	// check different aggregation operations
 	data.Operation = "max"
 	KubectlApplyWithTemplate(t, data, "scaledObjectTemplate", scaledObjectTemplate)
-	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 4, 60, 1),
-		"replica count should be 4 after 1 minute")
+	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 4, 60, 3),
+		"replica count should be 4 after 3 minute")
 
 	data.Operation = "avg"
 	KubectlApplyWithTemplate(t, data, "scaledObjectTemplate", scaledObjectTemplate)

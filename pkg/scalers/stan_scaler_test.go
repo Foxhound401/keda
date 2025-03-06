@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type parseStanMetadataTestData struct {
@@ -15,10 +17,27 @@ type parseStanMetadataTestData struct {
 	isError    bool
 }
 
+type parseStanTLSTestData struct {
+	metadata   map[string]string
+	authParams map[string]string
+	isError    bool
+	enableTLS  bool
+}
+
 type stanMetricIdentifier struct {
 	metadataTestData *parseStanMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
+}
+
+var validStanMetadata = map[string]string{
+	"natsServerMonitoringEndpoint": "stan-nats-ss.stan.svc.cluster.local:8222",
+	"queueGroup":                   "grp1",
+	"durableName":                  "ImDurable",
+	"subject":                      "Test",
+	"lagThreshold":                 "10",
+	"activationLagThreshold":       "5",
+	"useHttps":                     "true",
 }
 
 var testStanMetadata = []parseStanMetadataTestData{
@@ -42,6 +61,20 @@ var testStanMetadata = []parseStanMetadataTestData{
 	{map[string]string{"natsServerMonitoringEndpoint": "stan-nats-ss", "queueGroup": "grp1", "durableName": "ImDurable", "subject": "mySubject", "useHttps": "error"}, map[string]string{}, true},
 }
 
+var parseStanAuthParamsTestDataset = []parseStanTLSTestData{
+	// success
+	{map[string]string{"natsServerMonitoringEndpoint": "stan-nats-ss", "queueGroup": "grp1", "durableName": "ImDurable", "subject": "mySubject", "useHttps": "true"}, map[string]string{"tls": "enable", "ca": "caaa", "cert": "ceert", "key": "keey"}, false, true},
+	// success, TLS cert/key and assumed public CA
+	{map[string]string{"natsServerMonitoringEndpoint": "stan-nats-ss", "queueGroup": "grp1", "durableName": "ImDurable", "subject": "mySubject", "useHttps": "true"}, map[string]string{"tls": "enable", "cert": "ceert", "key": "keey"}, false, true},
+	// success, TLS CA only
+	{map[string]string{"natsServerMonitoringEndpoint": "stan-nats-ss", "queueGroup": "grp1", "durableName": "ImDurable", "subject": "mySubject", "useHttps": "true"}, map[string]string{"tls": "enable", "ca": "caa"}, false, true},
+	// Missing TLS key, should fail.
+	{map[string]string{"natsServerMonitoringEndpoint": "stan-nats-ss", "queueGroup": "grp1", "durableName": "ImDurable", "subject": "mySubject", "useHttps": "true"}, map[string]string{"tls": "enable", "cert": "ceert"}, true, false},
+	// Missing TLS cert, should fail.
+	{map[string]string{"natsServerMonitoringEndpoint": "stan-nats-ss", "queueGroup": "grp1", "durableName": "ImDurable", "subject": "mySubject", "useHttps": "true"}, map[string]string{"tls": "enable", "key": "keey"}, true, false},
+	// TLS invalid, should fail.
+	{map[string]string{"natsServerMonitoringEndpoint": "stan-nats-ss", "queueGroup": "grp1", "durableName": "ImDurable", "subject": "mySubject", "useHttps": "true"}, map[string]string{"tls": "yes", "ca": "caa", "cert": "ceert", "key": "keey"}, true, false},
+}
 var stanMetricIdentifiers = []stanMetricIdentifier{
 	{&testStanMetadata[4], 0, "s0-stan-mySubject"},
 	{&testStanMetadata[4], 1, "s1-stan-mySubject"},
@@ -49,7 +82,7 @@ var stanMetricIdentifiers = []stanMetricIdentifier{
 
 func TestStanParseMetadata(t *testing.T) {
 	for _, testData := range testStanMetadata {
-		_, err := parseStanMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
+		_, err := parseStanMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
 		} else if testData.isError && err == nil {
@@ -58,10 +91,37 @@ func TestStanParseMetadata(t *testing.T) {
 	}
 }
 
+func TestParseStanAuthParams(t *testing.T) {
+	for _, testData := range parseStanAuthParamsTestDataset {
+		meta, err := parseStanMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: validStanMetadata, AuthParams: testData.authParams})
+
+		if err != nil && !testData.isError {
+			t.Error("Expected success but got error", err)
+		}
+		if testData.isError && err == nil {
+			t.Error("Expected error but got success")
+		}
+		if meta.enableTLS != testData.enableTLS {
+			t.Errorf("Expected enableTLS to be set to %v but got %v\n", testData.enableTLS, meta.enableTLS)
+		}
+		if meta.enableTLS {
+			if meta.ca != testData.authParams["ca"] {
+				t.Errorf("Expected ca to be set to %v but got %v\n", testData.authParams["ca"], meta.enableTLS)
+			}
+			if meta.cert != testData.authParams["cert"] {
+				t.Errorf("Expected cert to be set to %v but got %v\n", testData.authParams["cert"], meta.cert)
+			}
+			if meta.key != testData.authParams["key"] {
+				t.Errorf("Expected key to be set to %v but got %v\n", testData.authParams["key"], meta.key)
+			}
+		}
+	}
+}
+
 func TestStanGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range stanMetricIdentifiers {
 		ctx := context.Background()
-		meta, err := parseStanMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ScalerIndex: testData.scalerIndex})
+		meta, err := parseStanMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, TriggerIndex: testData.triggerIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}

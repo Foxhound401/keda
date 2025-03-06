@@ -20,24 +20,22 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
 	"github.com/go-logr/logr"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	kedacontrollerutil "github.com/kedacore/keda/v2/controllers/keda/util"
 	"github.com/kedacore/keda/v2/pkg/scaling/executor"
+	kedastatus "github.com/kedacore/keda/v2/pkg/status"
 	version "github.com/kedacore/keda/v2/version"
-)
-
-const (
-	defaultHPAMinReplicas int32 = 1
-	defaultHPAMaxReplicas int32 = 100
 )
 
 // createAndDeployNewHPA creates and deploy HPA in the cluster for specified ScaledObject
@@ -60,9 +58,9 @@ func (r *ScaledObjectReconciler) createAndDeployNewHPA(ctx context.Context, logg
 	status := scaledObject.Status.DeepCopy()
 	status.HpaName = hpaName
 
-	err = kedacontrollerutil.UpdateScaledObjectStatus(ctx, r.Client, logger, scaledObject, status)
+	err = kedastatus.UpdateScaledObjectStatus(ctx, r.Client, logger, scaledObject, status)
 	if err != nil {
-		logger.Error(err, "Error updating scaledObject status with used hpaName")
+		logger.Error(err, "Failed to update scaledObject status with used hpaName")
 		return err
 	}
 
@@ -101,8 +99,8 @@ func (r *ScaledObjectReconciler) newHPAForScaledObject(ctx context.Context, logg
 		labels[key] = value
 	}
 
-	minReplicas := getHPAMinReplicas(scaledObject)
-	maxReplicas := getHPAMaxReplicas(scaledObject)
+	minReplicas := scaledObject.GetHPAMinReplicas()
+	maxReplicas := scaledObject.GetHPAMaxReplicas()
 
 	pausedCount, err := executor.GetPausedReplicaCount(scaledObject)
 	if err != nil {
@@ -177,18 +175,37 @@ func (r *ScaledObjectReconciler) updateHPAIfNeeded(ctx context.Context, logger l
 		logger.Info("Updated HPA according to ScaledObject", "HPA.Namespace", foundHpa.Namespace, "HPA.Name", foundHpa.Name)
 	}
 
+	if (hpa.ObjectMeta.Annotations == nil && foundHpa.ObjectMeta.Annotations != nil) ||
+		!equality.Semantic.DeepDerivative(hpa.ObjectMeta.Annotations, foundHpa.ObjectMeta.Annotations) {
+		logger.V(1).Info("Found difference in the HPA annotations according to ScaledObject", "currentHPA", foundHpa.ObjectMeta.Annotations, "newHPA", hpa.ObjectMeta.Annotations)
+		if err = r.Client.Update(ctx, hpa); err != nil {
+			foundHpa.ObjectMeta.Annotations = hpa.ObjectMeta.Annotations
+			logger.Error(err, "Failed to update HPA", "HPA.Namespace", foundHpa.Namespace, "HPA.Name", foundHpa.Name)
+			return err
+		}
+		logger.Info("Updated HPA according to ScaledObject", "HPA.Namespace", foundHpa.Namespace, "HPA.Name", foundHpa.Name)
+	}
+
 	return nil
 }
 
 // deleteAndCreateHpa delete old HPA and create new one
 func (r *ScaledObjectReconciler) renameHPA(ctx context.Context, logger logr.Logger, scaledObject *kedav1alpha1.ScaledObject, foundHpa *autoscalingv2.HorizontalPodAutoscaler, gvkr *kedav1alpha1.GroupVersionKindResource) error {
-	logger.Info("Deleting old HPA", "HPA.Namespace", scaledObject.Namespace, "HPA.Name", foundHpa.Name)
+	if err := r.deleteHPA(ctx, logger, scaledObject, foundHpa); err != nil {
+		return err
+	}
+	return r.createAndDeployNewHPA(ctx, logger, scaledObject, gvkr)
+}
+
+// deleteHpa delete existing HPA
+func (r *ScaledObjectReconciler) deleteHPA(ctx context.Context, logger logr.Logger, scaledObject *kedav1alpha1.ScaledObject, foundHpa *autoscalingv2.HorizontalPodAutoscaler) error {
+	logger.Info("Deleting existing HPA", "HPA.Namespace", scaledObject.Namespace, "HPA.Name", foundHpa.Name)
 	if err := r.Client.Delete(ctx, foundHpa); err != nil {
 		logger.Error(err, "Failed to delete old HPA", "HPA.Namespace", foundHpa.Namespace, "HPA.Name", foundHpa.Name)
 		return err
 	}
 
-	return r.createAndDeployNewHPA(ctx, logger, scaledObject, gvkr)
+	return nil
 }
 
 // getScaledObjectMetricSpecs returns MetricSpec for HPA, generater from Triggers defitinion in ScaledObject
@@ -197,7 +214,7 @@ func (r *ScaledObjectReconciler) getScaledObjectMetricSpecs(ctx context.Context,
 	var externalMetricNames []string
 	var resourceMetricNames []string
 
-	cache, err := r.ScaleHandler.GetScalersCache(ctx, scaledObject)
+	cache, err := r.ScaleHandler.GetScalersCache(ctx, scaledObject.DeepCopy())
 	if err != nil {
 		logger.Error(err, "Error getting scalers")
 		return nil, err
@@ -213,7 +230,7 @@ func (r *ScaledObjectReconciler) getScaledObjectMetricSpecs(ctx context.Context,
 		if metricSpec.External != nil {
 			externalMetricName := metricSpec.External.Metric.Name
 			if kedacontrollerutil.Contains(externalMetricNames, externalMetricName) {
-				return nil, fmt.Errorf("metricName %s defined multiple times in ScaledObject %s, please refer the documentation how to define metricName manually", externalMetricName, scaledObject.Name)
+				return nil, fmt.Errorf("metricName %s defined multiple times in ScaledObject %s", externalMetricName, scaledObject.Name)
 			}
 
 			// add the scaledobject.keda.sh/name label. This is how the MetricsAdapter will know which scaledobject a metric is for when the HPA queries it.
@@ -237,7 +254,67 @@ func (r *ScaledObjectReconciler) getScaledObjectMetricSpecs(ctx context.Context,
 
 	updateHealthStatus(scaledObject, externalMetricNames, status)
 
-	err = kedacontrollerutil.UpdateScaledObjectStatus(ctx, r.Client, logger, scaledObject, status)
+	// if ScalingModifiers struct is not empty, expect Formula and Target to be
+	// non-empty (is validated beforehand - in cache). Only if target is > 0.0
+	// create a compositeScaler structure
+	if scaledObject.IsUsingModifiers() {
+		// convert string to float (this is already validated in:
+		// cache, err := r.ScaleHandler.GetScalersCache(ctx, scaledObject.DeepCopy())
+		// at the beginning of this function, where the whole scalingModifiers are validated)
+		validNumTarget, _ := strconv.ParseFloat(scaledObject.Spec.Advanced.ScalingModifiers.Target, 64)
+
+		// check & get metric specs type
+		metricType := autoscalingv2.AverageValueMetricType
+		if scaledObject.Spec.Advanced.ScalingModifiers.MetricType != "" {
+			metricType = scaledObject.Spec.Advanced.ScalingModifiers.MetricType
+		}
+
+		if metricType == autoscalingv2.UtilizationMetricType {
+			err := fmt.Errorf("error metric target type is Utilization, but it needs to be AverageValue or Value for external metrics")
+			return nil, err
+		}
+
+		// if target is valid, use composite scaler. Expect defined formula that returns one metric
+		if validNumTarget > 0.0 {
+			quan := resource.NewMilliQuantity(int64(validNumTarget*1000), resource.DecimalSI)
+
+			correctHpaTarget := autoscalingv2.MetricTarget{
+				Type: metricType,
+			}
+			if metricType == autoscalingv2.AverageValueMetricType {
+				correctHpaTarget.AverageValue = quan
+			} else if metricType == autoscalingv2.ValueMetricType {
+				correctHpaTarget.Value = quan
+			}
+			compMetricName := kedav1alpha1.CompositeMetricName
+			compositeSpec := autoscalingv2.MetricSpec{
+				Type: autoscalingv2.MetricSourceType("External"),
+				External: &autoscalingv2.ExternalMetricSource{
+					Metric: autoscalingv2.MetricIdentifier{
+						Name: compMetricName,
+						Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{kedav1alpha1.ScaledObjectOwnerAnnotation: scaledObject.Name},
+						},
+					},
+					Target: correctHpaTarget,
+				},
+			}
+			status.CompositeScalerName = compMetricName
+
+			// overwrite external metrics in returned array with composite metric ONLY (keep resource metrics)
+			finalHpaSpecs := []autoscalingv2.MetricSpec{}
+			// keep resource specs
+			for _, rm := range scaledObjectMetricSpecs {
+				if rm.Resource != nil {
+					finalHpaSpecs = append(finalHpaSpecs, rm)
+				}
+			}
+			finalHpaSpecs = append(finalHpaSpecs, compositeSpec)
+			scaledObjectMetricSpecs = finalHpaSpecs
+		}
+	}
+	err = kedastatus.UpdateScaledObjectStatus(ctx, r.Client, logger, scaledObject, status)
+
 	if err != nil {
 		logger.Error(err, "Error updating scaledObject status with used externalMetricNames")
 		return nil, err
@@ -268,21 +345,4 @@ func getHPAName(scaledObject *kedav1alpha1.ScaledObject) string {
 
 func getDefaultHpaName(scaledObject *kedav1alpha1.ScaledObject) string {
 	return fmt.Sprintf("keda-hpa-%s", scaledObject.Name)
-}
-
-// getHPAMinReplicas returns MinReplicas based on definition in ScaledObject or default value if not defined
-func getHPAMinReplicas(scaledObject *kedav1alpha1.ScaledObject) *int32 {
-	if scaledObject.Spec.MinReplicaCount != nil && *scaledObject.Spec.MinReplicaCount > 0 {
-		return scaledObject.Spec.MinReplicaCount
-	}
-	tmp := defaultHPAMinReplicas
-	return &tmp
-}
-
-// getHPAMaxReplicas returns MaxReplicas based on definition in ScaledObject or default value if not defined
-func getHPAMaxReplicas(scaledObject *kedav1alpha1.ScaledObject) int32 {
-	if scaledObject.Spec.MaxReplicaCount != nil {
-		return *scaledObject.Spec.MaxReplicaCount
-	}
-	return defaultHPAMaxReplicas
 }
