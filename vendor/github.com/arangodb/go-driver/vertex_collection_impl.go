@@ -81,6 +81,15 @@ func (c *vertexCollection) Status(ctx context.Context) (CollectionStatus, error)
 	return result, nil
 }
 
+// Checksum returns a checksum for the specified collection
+func (c *vertexCollection) Checksum(ctx context.Context, withRevisions bool, withData bool) (CollectionChecksum, error) {
+	result, err := c.rawCollection().Checksum(ctx, withRevisions, withData)
+	if err != nil {
+		return CollectionChecksum{}, WithStack(err)
+	}
+	return result, nil
+}
+
 // Count fetches the number of document in the collection.
 func (c *vertexCollection) Count(ctx context.Context) (int64, error) {
 	result, err := c.rawCollection().Count(ctx)
@@ -172,6 +181,15 @@ func (c *vertexCollection) Remove(ctx context.Context) error {
 // Truncate removes all documents from the collection, but leaves the indexes intact.
 func (c *vertexCollection) Truncate(ctx context.Context) error {
 	if err := c.rawCollection().Truncate(ctx); err != nil {
+		return WithStack(err)
+	}
+	return nil
+}
+
+// Rename renames the collection (SINGLE server only).
+// If the collection does not exist, a NotFoundError is returned.
+func (c *vertexCollection) Rename(ctx context.Context, newName string) error {
+	if err := c.rawCollection().Rename(ctx, newName); err != nil {
 		return WithStack(err)
 	}
 	return nil

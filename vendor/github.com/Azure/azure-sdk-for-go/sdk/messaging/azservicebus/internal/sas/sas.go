@@ -3,6 +3,7 @@
 
 // Package sas provides SAS token functionality which implements TokenProvider from package auth for use with Azure
 // Event Hubs and Service Bus.
+
 package sas
 
 import (
@@ -87,7 +88,6 @@ func NewTokenProvider(opts ...TokenProviderOption) (*TokenProvider, error) {
 // GetToken gets a CBS SAS token
 func (t *TokenProvider) GetToken(audience string) (*auth.Token, error) {
 	if t.sas != "" {
-		// the expiration date doesn't matter here so we'll just set it 0.
 		return auth.NewToken(auth.CBSTokenTypeSAS, t.sas, "0"), nil
 	}
 
@@ -138,22 +138,22 @@ func (s *Signer) SignWithExpiry(uri, expiry string) (string, error) {
 // CreateConnectionStringWithSharedAccessSignature generates a new connection string with
 // an embedded SharedAccessSignature and expiration.
 // Ex: Endpoint=sb://<sb>.servicebus.windows.net;SharedAccessSignature=SharedAccessSignature sr=<sb>.servicebus.windows.net&sig=<base64-sig>&se=<expiry>&skn=<keyname>"
-func CreateConnectionStringWithSAS(connectionString string, duration time.Duration) (string, error) {
-	parsed, err := conn.ParsedConnectionFromStr(connectionString)
+func CreateConnectionStringWithSASUsingExpiry(connectionString string, expiry time.Time) (string, error) {
+	props, err := conn.ParseConnectionString(connectionString)
 
 	if err != nil {
 		return "", err
 	}
 
-	signer := NewSigner(parsed.KeyName, parsed.Key)
+	signer := NewSigner(*props.SharedAccessKeyName, *props.SharedAccessKey)
 
-	sig, _, err := signer.SignWithDuration(parsed.Namespace, duration)
+	sig, err := signer.SignWithExpiry(props.FullyQualifiedNamespace, fmt.Sprintf("%d", expiry.Unix()))
 
 	if err != nil {
 		return "", err
 	}
 
-	return fmt.Sprintf("Endpoint=sb://%s;SharedAccessSignature=%s", parsed.Namespace, sig), nil
+	return fmt.Sprintf("Endpoint=sb://%s;SharedAccessSignature=%s", props.FullyQualifiedNamespace, sig), nil
 }
 
 func signatureExpiry(from time.Time, interval time.Duration) string {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -98,7 +99,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginx:1.14.2
+        image: nginxinc/nginx-unprivileged
         ports:
         - containerPort: 80
 `
@@ -145,7 +146,6 @@ spec:
         - containerPort: 1883
           name: mqtt
           protocol: TCP
-        resources:
         volumeMounts:
         - name: remote-access-cm
           mountPath: /opt/apache-activemq-5.16.3/webapps/api/WEB-INF/classes/jolokia-access.xml
@@ -447,9 +447,13 @@ spec:
 )
 
 func TestActiveMQScaler(t *testing.T) {
-	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
 	data, templates := getTemplateData()
+	t.Cleanup(func() {
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
+
+	// Create kubernetes resources
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
 	// setup activemq
@@ -462,16 +466,13 @@ func TestActiveMQScaler(t *testing.T) {
 	testActivation(t, kc)
 	testScaleOut(t, kc)
 	testScaleIn(t, kc)
-
-	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
 }
 
 func setupActiveMQ(t *testing.T, kc *kubernetes.Clientset) {
-	assert.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, "activemq", testNamespace, 1, 60, 3),
+	require.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, "activemq", testNamespace, 1, 60, 3),
 		"activemq should be up")
 	err := checkIfActiveMQStatusIsReady(t, activemqPodName)
-	assert.NoErrorf(t, err, "%s", err)
+	require.NoErrorf(t, err, "%s", err)
 }
 
 func checkIfActiveMQStatusIsReady(t *testing.T, name string) error {

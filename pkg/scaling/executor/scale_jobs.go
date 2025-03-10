@@ -38,13 +38,13 @@ const (
 	defaultFailedJobsHistoryLimit     = int32(100)
 )
 
-func (e *scaleExecutor) RequestJobScale(ctx context.Context, scaledJob *kedav1alpha1.ScaledJob, isActive bool, scaleTo int64, maxScale int64) {
+func (e *scaleExecutor) RequestJobScale(ctx context.Context, scaledJob *kedav1alpha1.ScaledJob, isActive, isError bool, scaleTo int64, maxScale int64) {
 	logger := e.logger.WithValues("scaledJob.Name", scaledJob.Name, "scaledJob.Namespace", scaledJob.Namespace)
 
 	runningJobCount := e.getRunningJobCount(ctx, scaledJob)
 	pendingJobCount := e.getPendingJobCount(ctx, scaledJob)
 	logger.Info("Scaling Jobs", "Number of running Jobs", runningJobCount)
-	logger.Info("Scaling Jobs", "Number of pending Jobs ", pendingJobCount)
+	logger.Info("Scaling Jobs", "Number of pending Jobs", pendingJobCount)
 
 	effectiveMaxScale, scaleTo := e.getScalingDecision(scaledJob, runningJobCount, scaleTo, maxScale, pendingJobCount, logger)
 
@@ -63,6 +63,28 @@ func (e *scaleExecutor) RequestJobScale(ctx context.Context, scaledJob *kedav1al
 		e.createJobs(ctx, logger, scaledJob, scaleTo, effectiveMaxScale)
 	} else {
 		logger.V(1).Info("No change in activity")
+	}
+
+	readyCondition := scaledJob.Status.Conditions.GetReadyCondition()
+	if isError {
+		// some triggers responded with error
+		// Set ScaledJob.Status.ReadyCondition to Unknown
+		msg := "Some triggers defined in ScaledJob are not working correctly"
+		logger.V(1).Info(msg)
+		if !readyCondition.IsUnknown() {
+			if err := e.setReadyCondition(ctx, logger, scaledJob, metav1.ConditionUnknown, "PartialTriggerError", msg); err != nil {
+				logger.Error(err, "error setting ready condition")
+			}
+		}
+	} else if !readyCondition.IsTrue() {
+		// if the ScaledObject's triggers aren't in the error state,
+		// but ScaledJob.Status.ReadyCondition is set not set to 'true' -> set it back to 'true'
+		msg := "ScaledJob is defined correctly and is ready for scaling"
+		logger.V(1).Info(msg)
+		if err := e.setReadyCondition(ctx, logger, scaledJob, metav1.ConditionTrue,
+			"ScaledJobReady", msg); err != nil {
+			logger.Error(err, "error setting ready condition")
+		}
 	}
 
 	condition := scaledJob.Status.Conditions.GetActiveCondition()
@@ -95,24 +117,40 @@ func (e *scaleExecutor) getScalingDecision(scaledJob *kedav1alpha1.ScaledJob, ru
 		scaleTo = scaleToMinReplica
 		effectiveMaxScale = scaleToMinReplica
 	} else {
-		effectiveMaxScale = NewScalingStrategy(logger, scaledJob).GetEffectiveMaxScale(maxScale, runningJobCount-minReplicaCount, pendingJobCount, scaledJob.MaxReplicaCount())
+		effectiveMaxScale, scaleTo = NewScalingStrategy(logger, scaledJob).GetEffectiveMaxScale(maxScale, runningJobCount-minReplicaCount, pendingJobCount, scaledJob.MaxReplicaCount(), scaleTo)
 	}
 	return effectiveMaxScale, scaleTo
 }
 
 func (e *scaleExecutor) createJobs(ctx context.Context, logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob, scaleTo int64, maxScale int64) {
+	if maxScale <= 0 {
+		logger.Info("No need to create jobs - all requested jobs already exist", "jobs", maxScale)
+		return
+	}
+	logger.Info("Creating jobs", "Effective number of max jobs", maxScale)
+	if scaleTo > maxScale {
+		scaleTo = maxScale
+	}
+	logger.Info("Creating jobs", "Number of jobs", scaleTo)
+
+	jobs := e.generateJobs(logger, scaledJob, scaleTo)
+	for _, job := range jobs {
+		err := e.client.Create(ctx, job)
+		if err != nil {
+			logger.Error(err, "Failed to create a new Job")
+		}
+	}
+
+	logger.Info("Created jobs", "Number of jobs", scaleTo)
+	e.recorder.Eventf(scaledJob, corev1.EventTypeNormal, eventreason.KEDAJobsCreated, "Created %d jobs", scaleTo)
+}
+
+func (e *scaleExecutor) generateJobs(logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob, scaleTo int64) []*batchv1.Job {
 	scaledJob.Spec.JobTargetRef.Template.GenerateName = scaledJob.GetName() + "-"
 	if scaledJob.Spec.JobTargetRef.Template.Labels == nil {
 		scaledJob.Spec.JobTargetRef.Template.Labels = map[string]string{}
 	}
 	scaledJob.Spec.JobTargetRef.Template.Labels["scaledjob.keda.sh/name"] = scaledJob.GetName()
-
-	logger.Info("Creating jobs", "Effective number of max jobs", maxScale)
-
-	if scaleTo > maxScale {
-		scaleTo = maxScale
-	}
-	logger.Info("Creating jobs", "Number of jobs", scaleTo)
 
 	labels := map[string]string{
 		"app.kubernetes.io/name":       scaledJob.GetName(),
@@ -125,12 +163,21 @@ func (e *scaleExecutor) createJobs(ctx context.Context, logger logr.Logger, scal
 		labels[key] = value
 	}
 
+	annotations := map[string]string{
+		"scaledjob.keda.sh/generation": strconv.FormatInt(scaledJob.Generation, 10),
+	}
+	for key, value := range scaledJob.ObjectMeta.Annotations {
+		annotations[key] = value
+	}
+
+	jobs := make([]*batchv1.Job, int(scaleTo))
 	for i := 0; i < int(scaleTo); i++ {
 		job := &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
 				GenerateName: scaledJob.GetName() + "-",
 				Namespace:    scaledJob.GetNamespace(),
 				Labels:       labels,
+				Annotations:  annotations,
 			},
 			Spec: *scaledJob.Spec.JobTargetRef.DeepCopy(),
 		}
@@ -148,13 +195,9 @@ func (e *scaleExecutor) createJobs(ctx context.Context, logger logr.Logger, scal
 			logger.Error(err, "Failed to set ScaledJob as the owner of the new Job")
 		}
 
-		err = e.client.Create(ctx, job)
-		if err != nil {
-			logger.Error(err, "Failed to create a new Job")
-		}
+		jobs[i] = job
 	}
-	logger.Info("Created jobs", "Number of jobs", scaleTo)
-	e.recorder.Eventf(scaledJob, corev1.EventTypeNormal, eventreason.KEDAJobsCreated, "Created %d jobs", scaleTo)
+	return jobs
 }
 
 func (e *scaleExecutor) isJobFinished(j *batchv1.Job) bool {
@@ -182,7 +225,6 @@ func (e *scaleExecutor) getRunningJobCount(ctx context.Context, scaledJob *kedav
 	}
 
 	for _, job := range jobs.Items {
-		job := job
 		if !e.isJobFinished(&job) {
 			runningJobs++
 		}
@@ -256,8 +298,6 @@ func (e *scaleExecutor) getPendingJobCount(ctx context.Context, scaledJob *kedav
 	}
 
 	for _, job := range jobs.Items {
-		job := job
-
 		if !e.isJobFinished(&job) {
 			if len(scaledJob.Spec.ScalingStrategy.PendingPodConditions) > 0 {
 				if !e.areAllPendingPodConditionsFulfilled(ctx, &job, scaledJob.Spec.ScalingStrategy.PendingPodConditions) {
@@ -290,10 +330,9 @@ func (e *scaleExecutor) cleanUp(ctx context.Context, scaledJob *kedav1alpha1.Sca
 		return err
 	}
 
-	completedJobs := []batchv1.Job{}
-	failedJobs := []batchv1.Job{}
+	var completedJobs []batchv1.Job
+	var failedJobs []batchv1.Job
 	for _, job := range jobs.Items {
-		job := job
 		finishedJobConditionType := e.getFinishedJobConditionType(&job)
 		switch finishedJobConditionType {
 		case batchv1.JobComplete:
@@ -381,6 +420,9 @@ func NewScalingStrategy(logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob) S
 	case "accurate":
 		logger.V(1).Info("Selecting Scale Strategy", "specified", scaledJob.Spec.ScalingStrategy.Strategy, "selected", "accurate")
 		return accurateScalingStrategy{}
+	case "eager":
+		logger.V(1).Info("Selecting Scale Strategy", "specified", scaledJob.Spec.ScalingStrategy.Strategy, "selected", "eager")
+		return eagerScalingStrategy{}
 	default:
 		logger.V(1).Info("Selecting Scale Strategy", "specified", scaledJob.Spec.ScalingStrategy.Strategy, "selected", "default")
 		return defaultScalingStrategy{}
@@ -389,14 +431,14 @@ func NewScalingStrategy(logger logr.Logger, scaledJob *kedav1alpha1.ScaledJob) S
 
 // ScalingStrategy is an interface for switching scaling algorithm
 type ScalingStrategy interface {
-	GetEffectiveMaxScale(maxScale, runningJobCount, pendingJobCount, maxReplicaCount int64) int64
+	GetEffectiveMaxScale(maxScale, runningJobCount, pendingJobCount, maxReplicaCount, scaleTo int64) (int64, int64)
 }
 
 type defaultScalingStrategy struct {
 }
 
-func (s defaultScalingStrategy) GetEffectiveMaxScale(maxScale, runningJobCount, pendingJobCount, maxReplicaCount int64) int64 {
-	return maxScale - runningJobCount
+func (s defaultScalingStrategy) GetEffectiveMaxScale(maxScale, runningJobCount, _, _, scaleTo int64) (int64, int64) {
+	return maxScale - runningJobCount, scaleTo
 }
 
 type customScalingStrategy struct {
@@ -404,23 +446,23 @@ type customScalingStrategy struct {
 	CustomScalingRunningJobPercentage *float64
 }
 
-func (s customScalingStrategy) GetEffectiveMaxScale(maxScale, runningJobCount, pendingJobCount, maxReplicaCount int64) int64 {
-	return min(maxScale-int64(*s.CustomScalingQueueLengthDeduction)-int64(float64(runningJobCount)*(*s.CustomScalingRunningJobPercentage)), maxReplicaCount)
+func (s customScalingStrategy) GetEffectiveMaxScale(maxScale, runningJobCount, _, maxReplicaCount, scaleTo int64) (int64, int64) {
+	return min(maxScale-int64(*s.CustomScalingQueueLengthDeduction)-int64(float64(runningJobCount)*(*s.CustomScalingRunningJobPercentage)), maxReplicaCount), scaleTo
 }
 
 type accurateScalingStrategy struct {
 }
 
-func (s accurateScalingStrategy) GetEffectiveMaxScale(maxScale, runningJobCount, pendingJobCount, maxReplicaCount int64) int64 {
+func (s accurateScalingStrategy) GetEffectiveMaxScale(maxScale, runningJobCount, pendingJobCount, maxReplicaCount, scaleTo int64) (int64, int64) {
 	if (maxScale + runningJobCount) > maxReplicaCount {
-		return maxReplicaCount - runningJobCount
+		return maxReplicaCount - runningJobCount, scaleTo
 	}
-	return maxScale - pendingJobCount
+	return maxScale - pendingJobCount, scaleTo
 }
 
-func min(x, y int64) int64 {
-	if x > y {
-		return y
-	}
-	return x
+type eagerScalingStrategy struct {
+}
+
+func (s eagerScalingStrategy) GetEffectiveMaxScale(maxScale, runningJobCount, pendingJobCount, maxReplicaCount, _ int64) (int64, int64) {
+	return min(maxReplicaCount-runningJobCount-pendingJobCount, maxScale), maxReplicaCount
 }

@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type parseArangoDBMetadataTestData struct {
@@ -68,20 +70,20 @@ var testArangoDBAuthMetadata = []arangoDBAuthMetadataTestData{
 
 type arangoDBMetricIdentifier struct {
 	metadataTestData *parseArangoDBMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
 var arangoDBMetricIdentifiers = []arangoDBMetricIdentifier{
-	{metadataTestData: &testArangoDBMetadata[2], scalerIndex: 0, name: "s0-arangodb"},
-	{metadataTestData: &testArangoDBMetadata[2], scalerIndex: 1, name: "s1-arangodb"},
+	{metadataTestData: &testArangoDBMetadata[2], triggerIndex: 0, name: "s0-arangodb"},
+	{metadataTestData: &testArangoDBMetadata[2], triggerIndex: 1, name: "s1-arangodb"},
 }
 
 func TestParseArangoDBMetadata(t *testing.T) {
-	for _, testData := range testArangoDBMetadata {
-		_, err := parseArangoDBMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
+	for idx, testData := range testArangoDBMetadata {
+		_, err := parseArangoDBMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
 		if err != nil && !testData.raisesError {
-			t.Error("Expected success but got error:", err)
+			t.Errorf("Test %v: expected success but got error: %s", idx, err)
 		}
 		if err == nil && testData.raisesError {
 			t.Error("Expected error but got success")
@@ -91,7 +93,7 @@ func TestParseArangoDBMetadata(t *testing.T) {
 
 func TestArangoDBScalerAuthParams(t *testing.T) {
 	for _, testData := range testArangoDBAuthMetadata {
-		meta, err := parseArangoDBMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
+		meta, err := parseArangoDBMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
 
 		if err != nil && !testData.raisesError {
 			t.Error("Expected success but got error", err)
@@ -101,7 +103,7 @@ func TestArangoDBScalerAuthParams(t *testing.T) {
 		}
 
 		if err == nil {
-			if meta.arangoDBAuth.EnableBasicAuth && !strings.Contains(testData.metadata["authModes"], "basic") {
+			if meta.ArangoDBAuth.EnabledBasicAuth() && !strings.Contains(testData.metadata["authModes"], "basic") {
 				t.Error("wrong auth mode detected")
 			}
 		}
@@ -110,10 +112,10 @@ func TestArangoDBScalerAuthParams(t *testing.T) {
 
 func TestArangoDBGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range arangoDBMetricIdentifiers {
-		meta, err := parseArangoDBMetadata(&ScalerConfig{
+		meta, err := parseArangoDBMetadata(&scalersconfig.ScalerConfig{
 			AuthParams:      testData.metadataTestData.authParams,
 			TriggerMetadata: testData.metadataTestData.metadata,
-			ScalerIndex:     testData.scalerIndex,
+			TriggerIndex:    testData.triggerIndex,
 		})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)

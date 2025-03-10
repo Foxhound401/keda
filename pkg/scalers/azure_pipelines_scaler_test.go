@@ -6,6 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/go-logr/logr"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 const loadCount = 1000 // the size of the pretend pool completed of job requests
@@ -27,7 +31,7 @@ var testAzurePipelinesMetadata = []parseAzurePipelinesMetadataTestData{
 	// empty
 	{"empty", map[string]string{}, true, testAzurePipelinesResolvedEnv, map[string]string{}},
 	// all properly formed
-	{"all properly formed", map[string]string{"organizationURLFromEnv": "AZP_URL", "personalAccessTokenFromEnv": "AZP_TOKEN", "poolID": "1", "targetPipelinesQueueLength": "1"}, false, testAzurePipelinesResolvedEnv, map[string]string{}},
+	{"all properly formed", map[string]string{"organizationURLFromEnv": "AZP_URL", "personalAccessTokenFromEnv": "AZP_TOKEN", "poolID": "1", "targetPipelinesQueueLength": "1", "jobsToFetch": "300"}, false, testAzurePipelinesResolvedEnv, map[string]string{}},
 	// using triggerAuthentication
 	{"using triggerAuthentication", map[string]string{"poolID": "1", "targetPipelinesQueueLength": "1"}, false, testAzurePipelinesResolvedEnv, map[string]string{"organizationURL": "https://dev.azure.com/sample", "personalAccessToken": "sample"}},
 	// using triggerAuthentication with personalAccessToken terminating in newline
@@ -40,9 +44,11 @@ var testAzurePipelinesMetadata = []parseAzurePipelinesMetadataTestData{
 	{"missing poolID", map[string]string{"organizationURLFromEnv": "AZP_URL", "personalAccessTokenFromEnv": "AZP_TOKEN", "poolID": "", "targetPipelinesQueueLength": "1"}, true, testAzurePipelinesResolvedEnv, map[string]string{}},
 	// activationTargetPipelinesQueueLength malformed
 	{"all properly formed", map[string]string{"organizationURLFromEnv": "AZP_URL", "personalAccessTokenFromEnv": "AZP_TOKEN", "poolID": "1", "targetPipelinesQueueLength": "1", "activationTargetPipelinesQueueLength": "A"}, true, testAzurePipelinesResolvedEnv, map[string]string{}},
+	// jobsToFetch malformed
+	{"jobsToFetch malformed", map[string]string{"organizationURLFromEnv": "AZP_URL", "personalAccessTokenFromEnv": "AZP_TOKEN", "poolID": "1", "targetPipelinesQueueLength": "1", "jobsToFetch": "test"}, true, testAzurePipelinesResolvedEnv, map[string]string{}},
 }
 
-var testJobRequestResponse = `{"count":2,"value":[{"requestId":890659,"queueTime":"2022-09-28T11:19:49.89Z","assignTime":"2022-09-28T11:20:29.5033333Z","receiveTime":"2022-09-28T11:20:32.0530499Z","lockedUntil":"2022-09-28T11:30:32.07Z","serviceOwner":"xxx","hostId":"xxx","scopeId":"xxx","planType":"Build","planId":"xxx","jobId":"xxx","demands":["kubectl","Agent.Version -gtVersion 2.182.1"],"reservedAgent":{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11735"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11735"}},"id":11735,"name":"kube-scaledjob-5nlph-kzpgf","version":"2.210.1","osDescription":"Linux 5.4.0-1089-azure #94~18.04.1-Ubuntu SMP Fri Aug 5 12:34:50 UTC 2022","enabled":true,"status":"online","provisioningState":"Provisioned","accessPoint":"CodexAccessMapping"},"definition":{"_links":{"web":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_build/definition?definitionId=4869"},"self":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_apis/build/Definitions/4869"}},"id":4869,"name":"base - main"},"owner":{"_links":{"web":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_build/results?buildId=673584"},"self":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_apis/build/Builds/673584"}},"id":673584,"name":"20220928.2"},"data":{"ParallelismTag":"Private","IsScheduledKey":"False"},"poolId":44,"orchestrationId":"5c5c8ec9-786f-4e97-99d4-a29279befba3.build.__default","priority":0},{"requestId":890663,"queueTime":"2022-09-28T11:20:22.4633333Z","serviceOwner":"00025394-6065-48ca-87d9-7f5672854ef7","hostId":"41a18c7d-df5e-4032-a4df-d533b56bd2de","scopeId":"02696e26-a35b-424c-86b8-1f54e1b0b4b7","planType":"Build","planId":"b718cfed-493c-46be-a650-88fe762f75aa","jobId":"15b95994-59ec-5502-695d-0b93722883bd","demands":["dotnet60","java","Agent.Version -gtVersion 2.182.1"],"matchedAgents":[{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/1755"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=1755"}},"id":1755,"name":"dotnet60-keda-template","version":"2.210.1","enabled":true,"status":"offline","provisioningState":"Provisioned"},{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11732"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11732"}},"id":11732,"name":"dotnet60-scaledjob-5dsgc-pkqvm","version":"2.210.1","enabled":true,"status":"online","provisioningState":"Provisioned"},{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11733"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11733"}},"id":11733,"name":"dotnet60-scaledjob-zgqnp-8h4z4","version":"2.210.1","enabled":true,"status":"online","provisioningState":"Provisioned"},{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11734"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11734"}},"id":11734,"name":"dotnet60-scaledjob-wr65c-ff2cv","version":"2.210.1","enabled":true,"status":"online","provisioningState":"Provisioned"}],"definition":{"_links":{"web":{"href":"https://FOO.visualstudio.com/02696e26-a35b-424c-86b8-1f54e1b0b4b7/_build/definition?definitionId=3129"},"self":{"href":"https://FOO.visualstudio.com/02696e26-a35b-424c-86b8-1f54e1b0b4b7/_apis/build/Definitions/3129"}},"id":3129,"name":"Other Build CI"},"owner":{"_links":{"web":{"href":"https://FOO.visualstudio.com/02696e26-a35b-424c-86b8-1f54e1b0b4b7/_build/results?buildId=673585"},"self":{"href":"https://FOO.visualstudio.com/02696e26-a35b-424c-86b8-1f54e1b0b4b7/_apis/build/Builds/673585"}},"id":673585,"name":"20220928.11"},"data":{"ParallelismTag":"Private","IsScheduledKey":"False"},"poolId":44,"orchestrationId":"b718cfed-493c-46be-a650-88fe762f75aa.buildtest.build_and_test.__default","priority":0}]}`
+var testJobRequestResponse = `{"count":2,"value":[{"requestId":890659,"queueTime":"2022-09-28T11:19:49.89Z","assignTime":"2022-09-28T11:20:29.5033333Z","receiveTime":"2022-09-28T11:20:32.0530499Z","lockedUntil":"2022-09-28T11:30:32.07Z","serviceOwner":"xxx","hostId":"xxx","scopeId":"xxx","planType":"Build","planId":"xxx","jobId":"xxx","demands":["kubectl","Agent.Version -gtVersion 2.182.1"],"reservedAgent":{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11735"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11735"}},"id":11735,"name":"kube-scaledjob-5nlph-kzpgf","version":"2.210.1","osDescription":"Linux 5.4.0-1089-azure #94~18.04.1-Ubuntu SMP Fri Aug 5 12:34:50 UTC 2022","enabled":true,"status":"online","provisioningState":"Provisioned","accessPoint":"CodexAccessMapping"},"definition":{"_links":{"web":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_build/definition?definitionId=4869"},"self":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_apis/build/Definitions/4869"}},"id":4869,"name":"base - main"},"owner":{"_links":{"web":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_build/results?buildId=673584"},"self":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_apis/build/Builds/673584"}},"id":673584,"name":"20220928.2"},"data":{"ParallelismTag":"Private","IsScheduledKey":"False"},"poolId":44,"orchestrationId":"5c5c8ec9-786f-4e97-99d4-a29279befba3.build.__default","priority":0},{"requestId":890663,"queueTime":"2022-09-28T11:20:22.4633333Z","serviceOwner":"00025394-6065-48ca-87d9-7f5672854ef7","hostId":"41a18c7d-df5e-4032-a4df-d533b56bd2de","scopeId":"02696e26-a35b-424c-86b8-1f54e1b0b4b7","planType":"Build","planId":"b718cfed-493c-46be-a650-88fe762f75aa","jobId":"15b95994-59ec-5502-695d-0b93722883bd","demands":["dotnet60","java","cmake","Agent.Version -gtVersion 2.182.1"],"matchedAgents":[{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/1755"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=1755"}},"id":1755,"name":"dotnet60-keda-template","version":"2.210.1","enabled":true,"status":"offline","provisioningState":"Provisioned"},{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11732"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11732"}},"id":11732,"name":"dotnet60-scaledjob-5dsgc-pkqvm","version":"2.210.1","enabled":true,"status":"online","provisioningState":"Provisioned"},{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11733"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11733"}},"id":11733,"name":"dotnet60-scaledjob-zgqnp-8h4z4","version":"2.210.1","enabled":true,"status":"online","provisioningState":"Provisioned"},{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11734"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11734"}},"id":11734,"name":"dotnet60-scaledjob-wr65c-ff2cv","version":"2.210.1","enabled":true,"status":"online","provisioningState":"Provisioned"}],"definition":{"_links":{"web":{"href":"https://FOO.visualstudio.com/02696e26-a35b-424c-86b8-1f54e1b0b4b7/_build/definition?definitionId=3129"},"self":{"href":"https://FOO.visualstudio.com/02696e26-a35b-424c-86b8-1f54e1b0b4b7/_apis/build/Definitions/3129"}},"id":3129,"name":"Other Build CI"},"owner":{"_links":{"web":{"href":"https://FOO.visualstudio.com/02696e26-a35b-424c-86b8-1f54e1b0b4b7/_build/results?buildId=673585"},"self":{"href":"https://FOO.visualstudio.com/02696e26-a35b-424c-86b8-1f54e1b0b4b7/_apis/build/Builds/673585"}},"id":673585,"name":"20220928.11"},"data":{"ParallelismTag":"Private","IsScheduledKey":"False"},"poolId":44,"orchestrationId":"b718cfed-493c-46be-a650-88fe762f75aa.buildtest.build_and_test.__default","priority":0}]}`
 var deadJob = `{"requestId":890659,"result":"succeeded","queueTime":"2022-09-28T11:19:49.89Z","assignTime":"2022-09-28T11:20:29.5033333Z","receiveTime":"2022-09-28T11:20:32.0530499Z","lockedUntil":"2022-09-28T11:30:32.07Z","serviceOwner":"xxx","hostId":"xxx","scopeId":"xxx","planType":"Build","planId":"xxx","jobId":"xxx","demands":["kubectl","Agent.Version -gtVersion 2.182.1"],"reservedAgent":{"_links":{"self":{"href":"https://dev.azure.com/FOO/_apis/distributedtask/pools/44/agents/11735"},"web":{"href":"https://dev.azure.com/FOO/_settings/agentpools?view=jobs&poolId=44&agentId=11735"}},"id":11735,"name":"kube-scaledjob-5nlph-kzpgf","version":"2.210.1","osDescription":"Linux 5.4.0-1089-azure #94~18.04.1-Ubuntu SMP Fri Aug 5 12:34:50 UTC 2022","enabled":true,"status":"online","provisioningState":"Provisioned","accessPoint":"CodexAccessMapping"},"definition":{"_links":{"web":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_build/definition?definitionId=4869"},"self":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_apis/build/Definitions/4869"}},"id":4869,"name":"base - main"},"owner":{"_links":{"web":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_build/results?buildId=673584"},"self":{"href":"https://dev.azure.com/FOO/1858395a-257e-4efd-bbc5-eb618128452b/_apis/build/Builds/673584"}},"id":673584,"name":"20220928.2"},"data":{"ParallelismTag":"Private","IsScheduledKey":"False"},"poolId":44,"orchestrationId":"5c5c8ec9-786f-4e97-99d4-a29279befba3.build.__default","priority":0}`
 
 func TestParseAzurePipelinesMetadata(t *testing.T) {
@@ -66,7 +72,9 @@ func TestParseAzurePipelinesMetadata(t *testing.T) {
 				testData.authParams["organizationURL"] = apiStub.URL
 			}
 
-			_, err := parseAzurePipelinesMetadata(context.TODO(), &ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams}, http.DefaultClient)
+			logger := logr.Discard()
+
+			_, _, err := parseAzurePipelinesMetadata(context.TODO(), logger, &scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams}, http.DefaultClient)
 			if err != nil && !testData.isError {
 				t.Error("Expected success but got error", err)
 			}
@@ -99,6 +107,8 @@ var testValidateAzurePipelinesPoolData = []validateAzurePipelinesPoolTestData{
 	{"poolName doesn't exist", map[string]string{"poolName": "sample"}, true, "poolName", http.StatusOK, `{"count":0,"value":[]}`},
 	// poolName is used if poolName and poolID are defined
 	{"poolName is used if poolName and poolID are defined", map[string]string{"poolName": "sample", "poolID": "1"}, false, "poolName", http.StatusOK, `{"count":1,"value":[{"id":1}]}`},
+	// poolName can have a space in it
+	{"poolName can have a space in it", map[string]string{"poolName": "sample pool name"}, false, "poolName", http.StatusOK, `{"count":1,"value":[{"id":1}]}`},
 }
 
 func TestValidateAzurePipelinesPool(t *testing.T) {
@@ -107,7 +117,7 @@ func TestValidateAzurePipelinesPool(t *testing.T) {
 			var apiStub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, ok := r.URL.Query()[testData.queryParam]
 				if !ok {
-					t.Error("Worng QueryParam")
+					t.Error("Wrong QueryParam")
 				}
 				w.WriteHeader(testData.httpCode)
 				_, _ = w.Write([]byte(testData.response))
@@ -117,8 +127,8 @@ func TestValidateAzurePipelinesPool(t *testing.T) {
 				"organizationURL":     apiStub.URL,
 				"personalAccessToken": "PAT",
 			}
-
-			_, err := parseAzurePipelinesMetadata(context.TODO(), &ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: nil, AuthParams: authParams}, http.DefaultClient)
+			logger := logr.Discard()
+			_, _, err := parseAzurePipelinesMetadata(context.TODO(), logger, &scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: nil, AuthParams: authParams}, http.DefaultClient)
 			if err != nil && !testData.isError {
 				t.Error("Expected success but got error", err)
 			}
@@ -130,8 +140,8 @@ func TestValidateAzurePipelinesPool(t *testing.T) {
 }
 
 type azurePipelinesMetricIdentifier struct {
-	scalerIndex int
-	name        string
+	triggerIndex int
+	name         string
 }
 
 var azurePipelinesMetricIdentifiers = []azurePipelinesMetricIdentifier{
@@ -156,7 +166,9 @@ func TestAzurePipelinesGetMetricSpecForScaling(t *testing.T) {
 			"targetPipelinesQueueLength": "1",
 		}
 
-		meta, err := parseAzurePipelinesMetadata(context.TODO(), &ScalerConfig{TriggerMetadata: metadata, ResolvedEnv: nil, AuthParams: authParams, ScalerIndex: testData.scalerIndex}, http.DefaultClient)
+		logger := logr.Discard()
+
+		meta, _, err := parseAzurePipelinesMetadata(context.TODO(), logger, &scalersconfig.ScalerConfig{TriggerMetadata: metadata, ResolvedEnv: nil, AuthParams: authParams, TriggerIndex: testData.triggerIndex}, http.DefaultClient)
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -179,7 +191,7 @@ func getMatchedAgentMetaData(url string) *azurePipelinesMetadata {
 	meta.organizationName = "testOrg"
 	meta.organizationURL = url
 	meta.parent = "dotnet60-keda-template"
-	meta.personalAccessToken = "testPAT"
+	meta.authContext.pat = "testPAT"
 	meta.poolID = 1
 	meta.targetPipelinesQueueLength = 1
 
@@ -199,18 +211,54 @@ func TestAzurePipelinesMatchedAgent(t *testing.T) {
 		httpClient: http.DefaultClient,
 	}
 
-	queuelen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.TODO())
+	queueLen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.TODO())
 
 	if err != nil {
 		t.Fail()
 	}
 
-	if queuelen < 1 {
+	if queueLen < 1 {
+		t.Fail()
+	}
+}
+
+func TestAzurePipelinesDelayed(t *testing.T) {
+	var apiStub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// nosemgrep: no-direct-write-to-responsewriter
+		w.Header().Add("X-RateLimit-Limit", "0")
+		// nosemgrep: no-direct-write-to-responsewriter
+		w.Header().Add("X-RateLimit-Delay", "42")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(buildLoadJSON())
+	}))
+
+	meta := getMatchedAgentMetaData(apiStub.URL)
+
+	mockAzurePipelinesScaler := azurePipelinesScaler{
+		metadata:   meta,
+		httpClient: http.DefaultClient,
+	}
+
+	queueLen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.Background())
+
+	if err != nil {
+		t.Fail()
+	}
+
+	if queueLen < 1 {
 		t.Fail()
 	}
 }
 
 func getDemandJobMetaData(url string) *azurePipelinesMetadata {
+	meta := getMatchedAgentMetaData(url)
+	meta.parent = ""
+	meta.demands = "dotnet60,java,cmake"
+
+	return meta
+}
+
+func getDemandJobSubsetMetadata(url string) *azurePipelinesMetadata {
 	meta := getMatchedAgentMetaData(url)
 	meta.parent = ""
 	meta.demands = "dotnet60,java"
@@ -239,13 +287,13 @@ func TestAzurePipelinesMatchedDemandAgent(t *testing.T) {
 		httpClient: http.DefaultClient,
 	}
 
-	queuelen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.TODO())
+	queueLen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.TODO())
 
 	if err != nil {
 		t.Fail()
 	}
 
-	if queuelen < 1 {
+	if queueLen < 1 {
 		t.Fail()
 	}
 }
@@ -257,12 +305,93 @@ func TestAzurePipelinesNonMatchedDemandAgent(t *testing.T) {
 	}))
 
 	meta := getMismatchDemandJobMetaData(apiStub.URL)
+	meta.requireAllDemands = true
 
 	mockAzurePipelinesScaler := azurePipelinesScaler{
 		metadata:   meta,
 		httpClient: http.DefaultClient,
 	}
 
+	queueLen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.TODO())
+
+	if err != nil {
+		t.Fail()
+	}
+
+	if queueLen > 0 {
+		t.Fail()
+	}
+}
+
+func TestAzurePipelinesMatchedDemandAgentWithRequireAllDemands(t *testing.T) {
+	var apiStub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(buildLoadJSON())
+	}))
+
+	meta := getDemandJobMetaData(apiStub.URL)
+	meta.requireAllDemands = true
+
+	mockAzurePipelinesScaler := azurePipelinesScaler{
+		metadata:   meta,
+		httpClient: http.DefaultClient,
+	}
+
+	queuelen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.TODO())
+
+	if err != nil {
+		t.Fail()
+	}
+
+	if queuelen < 1 {
+		t.Fail()
+	}
+}
+
+func TestAzurePipelinesMatchedDemandAgentWithRequireAllDemandsAndIgnoreOthers(t *testing.T) {
+	var apiStub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// nosemgrep: no-direct-write-to-responsewriter
+		_, _ = w.Write(buildLoadJSON())
+	}))
+
+	meta := getDemandJobSubsetMetadata(apiStub.URL)
+	meta.requireAllDemandsAndIgnoreOthers = true
+
+	mockAzurePipelinesScaler := azurePipelinesScaler{
+		metadata:   meta,
+		httpClient: http.DefaultClient,
+	}
+
+	// nosemgrep: context-todo
+	queuelen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.TODO())
+
+	if err != nil {
+		t.Fail()
+	}
+
+	if queuelen < 1 {
+		t.Fail()
+	}
+}
+
+func TestAzurePipelinesNotMatchedPartialRequiredTriggerDemands(t *testing.T) {
+	var apiStub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// nosemgrep: no-direct-write-to-responsewriter
+		_, _ = w.Write(buildLoadJSON())
+	}))
+
+	meta := getDemandJobMetaData(apiStub.URL)
+	meta.requireAllDemands = true
+	meta.demands = "kubectl,someOtherDemand" // the build demands only kubectl
+
+	mockAzurePipelinesScaler := azurePipelinesScaler{
+		metadata:   meta,
+		httpClient: http.DefaultClient,
+	}
+
+	// nosemgrep: context-todo
 	queuelen, err := mockAzurePipelinesScaler.GetAzurePipelinesQueueLength(context.TODO())
 
 	if err != nil {
