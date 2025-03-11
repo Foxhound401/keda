@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+
+	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type parsePostgreSQLMetadataTestData struct {
@@ -43,11 +46,11 @@ var postgreSQLMetricIdentifiers = []postgreSQLMetricIdentifier{
 
 func TestPosgresSQLGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range postgreSQLMetricIdentifiers {
-		meta, err := parsePostgreSQLMetadata(&ScalerConfig{ResolvedEnv: testData.resolvedEnv, TriggerMetadata: testData.metadataTestData.metadata, AuthParams: testData.authParam, ScalerIndex: testData.scaleIndex})
+		meta, _, err := parsePostgreSQLMetadata(logr.Discard(), &scalersconfig.ScalerConfig{ResolvedEnv: testData.resolvedEnv, TriggerMetadata: testData.metadataTestData.metadata, AuthParams: testData.authParam, TriggerIndex: testData.scaleIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
-		mockPostgresSQLScaler := postgreSQLScaler{"", meta, nil, logr.Discard()}
+		mockPostgresSQLScaler := postgreSQLScaler{"", meta, nil, kedav1alpha1.AuthPodIdentity{}, logr.Discard()}
 
 		metricSpec := mockPostgresSQLScaler.GetMetricSpecForScaling(context.Background())
 		metricName := metricSpec[0].External.Metric.Name
@@ -71,17 +74,38 @@ var testPostgreSQLConnectionstring = []postgreSQLConnectionStringTestData{
 	{metadata: map[string]string{"query": "test_query", "targetQueryValue": "5"}, authParam: map[string]string{"connection": "test_connection_from_auth"}, connectionString: "test_connection_from_auth"},
 	// from meta
 	{metadata: map[string]string{"query": "test_query", "targetQueryValue": "5", "host": "localhost", "port": "1234", "dbName": "testDb", "userName": "user", "sslmode": "required"}, connectionString: "host=localhost port=1234 user=user dbname=testDb sslmode=required password="},
+	// from meta, multiple hosts
+	{metadata: map[string]string{"query": "test_query", "targetQueryValue": "5", "host": "host1,host2", "port": "1234", "dbName": "testDb", "userName": "user", "sslmode": "required"}, connectionString: "host=host1,host2 port=1234 user=user dbname=testDb sslmode=required password="},
 }
 
 func TestPosgresSQLConnectionStringGeneration(t *testing.T) {
 	for _, testData := range testPostgreSQLConnectionstring {
-		meta, err := parsePostgreSQLMetadata(&ScalerConfig{ResolvedEnv: testData.resolvedEnv, TriggerMetadata: testData.metadata, AuthParams: testData.authParam, ScalerIndex: 0})
+		meta, _, err := parsePostgreSQLMetadata(logr.Discard(), &scalersconfig.ScalerConfig{ResolvedEnv: testData.resolvedEnv, TriggerMetadata: testData.metadata, AuthParams: testData.authParam, TriggerIndex: 0})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
 
-		if meta.connection != testData.connectionString {
-			t.Errorf("Error generating connectionString, expected '%s' and get '%s'", testData.connectionString, meta.connection)
+		if meta.Connection != testData.connectionString {
+			t.Errorf("Error generating connectionString, expected '%s' and get '%s'", testData.connectionString, meta.Connection)
+		}
+	}
+}
+
+var testPodIdentityAzureWorkloadPostgreSQLConnectionstring = []postgreSQLConnectionStringTestData{
+	// from meta
+	{metadata: map[string]string{"query": "test_query", "targetQueryValue": "5", "host": "localhost", "port": "1234", "dbName": "testDb", "userName": "user", "sslmode": "required"}, connectionString: "host=localhost port=1234 user=user dbname=testDb sslmode=required %PASSWORD%"},
+}
+
+func TestPodIdentityAzureWorkloadPosgresSQLConnectionStringGeneration(t *testing.T) {
+	identityID := "IDENTITY_ID_CORRESPONDING_TO_USERNAME_FIELD"
+	for _, testData := range testPodIdentityAzureWorkloadPostgreSQLConnectionstring {
+		meta, _, err := parsePostgreSQLMetadata(logr.Discard(), &scalersconfig.ScalerConfig{ResolvedEnv: testData.resolvedEnv, TriggerMetadata: testData.metadata, PodIdentity: kedav1alpha1.AuthPodIdentity{Provider: kedav1alpha1.PodIdentityProviderAzureWorkload, IdentityID: &identityID}, AuthParams: testData.authParam, TriggerIndex: 0})
+		if err != nil {
+			t.Fatal("Could not parse metadata:", err)
+		}
+
+		if meta.Connection != testData.connectionString {
+			t.Errorf("Error generating connectionString, expected '%s' and get '%s'", testData.connectionString, meta.Connection)
 		}
 	}
 }
@@ -131,7 +155,7 @@ var testPostgresMetadata = []parsePostgresMetadataTestData{
 
 func TestParsePosgresSQLMetadata(t *testing.T) {
 	for _, testData := range testPostgresMetadata {
-		_, err := parsePostgreSQLMetadata(&ScalerConfig{ResolvedEnv: testData.resolvedEnv, TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
+		_, _, err := parsePostgreSQLMetadata(logr.Discard(), &scalersconfig.ScalerConfig{ResolvedEnv: testData.resolvedEnv, TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
 		if err != nil && !testData.raisesError {
 			t.Error("Expected success but got error", err)
 		}

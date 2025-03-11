@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-logr/logr"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -51,7 +53,13 @@ type stanMetadata struct {
 	subject                string
 	lagThreshold           int64
 	activationLagThreshold int64
-	scalerIndex            int
+	triggerIndex           int
+
+	// TLS
+	enableTLS bool
+	cert      string
+	key       string
+	ca        string
 }
 
 const (
@@ -59,10 +67,12 @@ const (
 	defaultStanLagThreshold    = 10
 	natsStreamingHTTPProtocol  = "http"
 	natsStreamingHTTPSProtocol = "https"
+	stanTLSEnable              = "enable"
+	stanTLSDisable             = "disable"
 )
 
 // NewStanScaler creates a new stanScaler
-func NewStanScaler(config *ScalerConfig) (Scaler, error) {
+func NewStanScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -72,17 +82,24 @@ func NewStanScaler(config *ScalerConfig) (Scaler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error parsing stan metadata: %w", err)
 	}
-
+	httpClient := kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, false)
+	if stanMetadata.enableTLS {
+		config, err := kedautil.NewTLSConfig(stanMetadata.cert, stanMetadata.key, stanMetadata.ca, false)
+		if err != nil {
+			return nil, err
+		}
+		httpClient.Transport = kedautil.CreateHTTPTransportWithTLSConfig(config)
+	}
 	return &stanScaler{
 		channelInfo: &monitorChannelInfo{},
 		metricType:  metricType,
 		metadata:    stanMetadata,
-		httpClient:  kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, false),
+		httpClient:  httpClient,
 		logger:      InitializeLogger(config, "stan_scaler"),
 	}, nil
 }
 
-func parseStanMetadata(config *ScalerConfig) (stanMetadata, error) {
+func parseStanMetadata(config *scalersconfig.ScalerConfig) (stanMetadata, error) {
 	meta := stanMetadata{}
 
 	if config.TriggerMetadata["queueGroup"] == "" {
@@ -119,14 +136,35 @@ func parseStanMetadata(config *ScalerConfig) (stanMetadata, error) {
 		meta.activationLagThreshold = activationTargetQueryValue
 	}
 
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 
 	var err error
+
+	meta.enableTLS = false // Default value for enableTLS
 	useHTTPS := false
 	if val, ok := config.TriggerMetadata["useHttps"]; ok {
 		useHTTPS, err = strconv.ParseBool(val)
 		if err != nil {
 			return meta, fmt.Errorf("useHTTPS parsing error %w", err)
+		}
+		if val, ok := config.AuthParams["tls"]; ok {
+			val = strings.TrimSpace(val)
+			if val == stanTLSEnable {
+				certGiven := config.AuthParams["cert"] != ""
+				keyGiven := config.AuthParams["key"] != ""
+				if certGiven && !keyGiven {
+					return meta, errors.New("no key given")
+				}
+				if keyGiven && !certGiven {
+					return meta, errors.New("no cert given")
+				}
+				meta.cert = config.AuthParams["cert"]
+				meta.key = config.AuthParams["key"]
+				meta.ca = config.AuthParams["ca"]
+				meta.enableTLS = true
+			} else if val != stanTLSDisable {
+				return meta, fmt.Errorf("err incorrect value for TLS given: %s", val)
+			}
 		}
 	}
 	natsServerEndpoint, err := GetFromAuthOrMeta(config, "natsServerMonitoringEndpoint")
@@ -191,7 +229,7 @@ func (s *stanScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	metricName := kedautil.NormalizeString(fmt.Sprintf("stan-%s", s.metadata.subject))
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, metricName),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, metricName),
 		},
 		Target: GetMetricTarget(s.metricType, s.metadata.lagThreshold),
 	}
@@ -240,6 +278,7 @@ func (s *stanScaler) GetMetricsAndActivity(ctx context.Context, metricName strin
 	}
 	totalLag := s.getMaxMsgLag()
 	s.logger.V(1).Info("Stan scaler: Providing metrics based on totalLag, threshold", "totalLag", totalLag, "lagThreshold", s.metadata.lagThreshold)
+	s.logger.Info("The Stan scaler (NATS Streaming) is DEPRECATED and will be removed in v2.19 - Use scaler 'nats-jetstream' instead")
 
 	metric := GenerateMetricInMili(metricName, float64(totalLag))
 
@@ -248,5 +287,8 @@ func (s *stanScaler) GetMetricsAndActivity(ctx context.Context, metricName strin
 
 // Nothing to close here.
 func (s *stanScaler) Close(context.Context) error {
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }

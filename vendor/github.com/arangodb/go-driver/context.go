@@ -1,7 +1,7 @@
 //
 // DISCLAIMER
 //
-// Copyright 2017 ArangoDB GmbH, Cologne, Germany
+// Copyright 2017-2023 ArangoDB GmbH, Cologne, Germany
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,6 @@
 //
 // Copyright holder is ArangoDB GmbH, Cologne, Germany
 //
-// Author Ewout Prangsma
-// Author Tomasz Mielech <tomasz@arangodb.com>
-//
 
 package driver
 
@@ -28,6 +25,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/arangodb/go-driver/util"
@@ -66,6 +64,12 @@ const (
 	keyOverwrite                ContextKey = "arangodb-overwrite"
 	keyUseQueueTimeout          ContextKey = "arangodb-use-queue-timeout"
 	keyMaxQueueTime             ContextKey = "arangodb-max-queue-time-seconds"
+	keyDropCollections          ContextKey = "arangodb-drop-collections"
+	keyDriverFlags              ContextKey = "arangodb-driver-flags"
+	keyRefillIndexCaches        ContextKey = "arangodb-driver-refill-index-caches"
+	keyAsyncRequest             ContextKey = "arangodb-async-request"
+	keyAsyncID                  ContextKey = "arangodb-async-id"
+	keySkipExistCheck           ContextKey = "arangodb-skip-exist-check"
 )
 
 type OverwriteMode string
@@ -274,6 +278,42 @@ func WithOverwrite(parent context.Context) context.Context {
 	return context.WithValue(contextOrBackground(parent), keyOverwrite, true)
 }
 
+// WithDropCollections is used to configure a context to make graph removal functions to also drop the collections of the graph instead only the graph definition.
+// You can pass a single (optional) boolean. If that is set to true, you explicitly ask to also drop the collections of the graph.
+func WithDropCollections(parent context.Context, value ...bool) context.Context {
+	v := true
+	if len(value) == 1 {
+		v = value[0]
+	}
+	return context.WithValue(contextOrBackground(parent), keyDropCollections, v)
+}
+
+// WithDriverFlags is used to configure additional flags for the `x-arango-driver` header.
+func WithDriverFlags(parent context.Context, value []string) context.Context {
+	return context.WithValue(contextOrBackground(parent), keyDriverFlags, value)
+}
+
+// WithRefillIndexCaches is used to refill index caches during AQL operations.
+func WithRefillIndexCaches(parent context.Context, value bool) context.Context {
+	return context.WithValue(contextOrBackground(parent), keyRefillIndexCaches, value)
+}
+
+// WithAsync is used to configure a context to make an async operation - requires Connection with Async wrapper!
+func WithAsync(parent context.Context) context.Context {
+	return context.WithValue(contextOrBackground(parent), keyAsyncRequest, true)
+}
+
+// WithAsyncID is used to check an async operation result - requires Connection with Async wrapper!
+func WithAsyncID(parent context.Context, asyncID string) context.Context {
+	return context.WithValue(contextOrBackground(parent), keyAsyncID, asyncID)
+}
+
+// WithSkipExistCheck is used to disable validation for resource existence
+// e.g.: ClientDatabases.Database will do not call the additional check to ArangoDB for ensuring that DB exist
+func WithSkipExistCheck(parent context.Context, value bool) context.Context {
+	return context.WithValue(contextOrBackground(parent), keySkipExistCheck, value)
+}
+
 type contextSettings struct {
 	Silent                   bool
 	WaitForSync              bool
@@ -297,6 +337,8 @@ type contextSettings struct {
 	Overwrite                bool
 	QueueTimeout             bool
 	MaxQueueTime             time.Duration
+	DropCollections          *bool
+	RefillIndexCaches        *bool
 }
 
 // loadContextResponseValue loads generic values from the response and puts it into variables specified
@@ -322,6 +364,19 @@ func setDirtyReadFlagIfRequired(ctx context.Context, wasDirty bool) {
 	}
 }
 
+// ApplyVersionHeader adds the driver version to the request.
+func ApplyVersionHeader(ctx context.Context, req Request) {
+	val := fmt.Sprintf("go-driver-v1/%s", DriverVersion())
+	if ctx != nil {
+		if v := ctx.Value(keyDriverFlags); v != nil {
+			if flags, ok := v.([]string); ok {
+				val = fmt.Sprintf("%s (%s)", val, strings.Join(flags, ","))
+			}
+		}
+	}
+	req.SetHeader("x-arango-driver", val)
+}
+
 // applyContextSettings returns the settings configured in the context in the given request.
 // It then returns information about the applied settings that may be needed later in API implementation functions.
 func applyContextSettings(ctx context.Context, req Request) contextSettings {
@@ -329,6 +384,7 @@ func applyContextSettings(ctx context.Context, req Request) contextSettings {
 	if ctx == nil {
 		return result
 	}
+
 	// Details
 	if v := ctx.Value(keyDetails); v != nil {
 		if details, ok := v.(bool); ok {
@@ -489,11 +545,32 @@ func applyContextSettings(ctx context.Context, req Request) contextSettings {
 			result.OverwriteMode = mode
 		}
 	}
-
+	// DropCollections
+	if v := ctx.Value(keyDropCollections); v != nil {
+		if dropCollections, ok := v.(bool); ok {
+			req.SetQuery("dropCollections", strconv.FormatBool(dropCollections))
+			result.DropCollections = &dropCollections
+		}
+	}
+	// IndexCacheRefilling
+	if v := ctx.Value(keyRefillIndexCaches); v != nil {
+		if local, ok := v.(bool); ok {
+			req.SetQuery("refillIndexCaches", strconv.FormatBool(local))
+			result.RefillIndexCaches = &local
+		}
+	}
+	// Overwrite
 	if v := ctx.Value(keyOverwrite); v != nil {
 		if overwrite, ok := v.(bool); ok && overwrite {
 			req.SetQuery("overwrite", "true")
 			result.Overwrite = true
+		}
+	}
+
+	// AsyncID
+	if v := ctx.Value(keyAsyncID); v != nil {
+		if asyncID, ok := v.(string); ok {
+			req.SetHeader("x-arango-async-id", asyncID)
 		}
 	}
 

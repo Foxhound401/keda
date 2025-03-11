@@ -9,6 +9,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -22,10 +23,11 @@ const (
 )
 
 var (
-	testNamespace = fmt.Sprintf("%s-ns", testName)
-	serviceName   = fmt.Sprintf("%s-service", testName)
-	scalerName    = fmt.Sprintf("%s-scaler", testName)
-	scaledJobName = fmt.Sprintf("%s-sj", testName)
+	testNamespace         = fmt.Sprintf("%s-ns", testName)
+	serviceName           = fmt.Sprintf("%s-service", testName)
+	scalerName            = fmt.Sprintf("%s-scaler", testName)
+	scaledJobName         = fmt.Sprintf("%s-sj", testName)
+	metricsServerEndpoint = fmt.Sprintf("http://%s.%s.svc.cluster.local:8080/api/value", serviceName, testNamespace)
 )
 
 type templateData struct {
@@ -33,6 +35,7 @@ type templateData struct {
 	ServiceName                  string
 	ScalerName                   string
 	ScaledJobName                string
+	MetricsServerEndpoint        string
 	MetricThreshold, MetricValue int
 }
 
@@ -46,7 +49,11 @@ metadata:
 spec:
   ports:
     - port: 6000
+      name: grpc
       targetPort: 6000
+    - port: 8080
+      name: http
+      targetPort: 8080
   selector:
     app: {{.ScalerName}}
 `
@@ -71,10 +78,11 @@ spec:
     spec:
       containers:
         - name: scaler
-          image: ghcr.io/kedacore/tests-external-scaler-e2e:latest
+          image: ghcr.io/kedacore/tests-external-scaler:latest
           imagePullPolicy: Always
           ports:
           - containerPort: 6000
+          - containerPort: 8080
 `
 
 	scaledJobTemplate = `
@@ -105,8 +113,21 @@ spec:
       metadata:
         scalerAddress: {{.ServiceName}}.{{.TestNamespace}}:6000
         metricThreshold: "{{.MetricThreshold}}"
-        metricValue: "{{.MetricValue}}"
 `
+	updateMetricTemplate = `apiVersion: batch/v1
+kind: Job
+metadata:
+  name: update-metric-value
+  namespace: {{.TestNamespace}}
+spec:
+  template:
+    spec:
+      containers:
+      - name: curl-client
+        image: curlimages/curl
+        imagePullPolicy: Always
+        command: ["curl", "-X", "POST", "{{.MetricsServerEndpoint}}/{{.MetricValue}}"]
+      restartPolicy: Never`
 )
 
 func TestScaler(t *testing.T) {
@@ -119,6 +140,9 @@ func TestScaler(t *testing.T) {
 
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
+	require.True(t, WaitForDeploymentReplicaReadyCount(t, kc, scalerName, testNamespace, 1, 60, 1),
+		"replica count should be 1 after 1 minute")
+
 	assert.True(t, WaitForJobCount(t, kc, testNamespace, 0, 60, 1),
 		"job count should be 0 after 1 minute")
 
@@ -127,17 +151,17 @@ func TestScaler(t *testing.T) {
 	testScaleIn(t, kc, data)
 
 	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	DeleteKubernetesResources(t, testNamespace, data, templates)
 }
 
 func getTemplateData() (templateData, []Template) {
 	return templateData{
-			TestNamespace:   testNamespace,
-			ServiceName:     serviceName,
-			ScalerName:      scalerName,
-			ScaledJobName:   scaledJobName,
-			MetricThreshold: 10,
-			MetricValue:     0,
+			TestNamespace:         testNamespace,
+			ServiceName:           serviceName,
+			ScalerName:            scalerName,
+			ScaledJobName:         scaledJobName,
+			MetricThreshold:       10,
+			MetricsServerEndpoint: metricsServerEndpoint,
 		}, []Template{
 			{Name: "scalerTemplate", Config: scalerTemplate},
 			{Name: "serviceTemplate", Config: serviceTemplate},
@@ -150,10 +174,11 @@ func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 
 	t.Log("scaling to max replicas")
 	data.MetricValue = data.MetricThreshold * 3
-	KubectlApplyWithTemplate(t, data, "scaledJobTemplate", scaledJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 
-	assert.True(t, WaitForJobCount(t, kc, testNamespace, 3, 60, 1),
+	assert.True(t, WaitForScaledJobCount(t, kc, scaledJobName, testNamespace, 3, 60, 1),
 		"job count should be 3 after 1 minute")
+	KubectlDeleteWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 }
 
 func testScaleIn(t *testing.T, kc *kubernetes.Clientset, data templateData) {
@@ -161,8 +186,9 @@ func testScaleIn(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 
 	t.Log("scaling to idle replicas")
 	data.MetricValue = 0
-	KubectlApplyWithTemplate(t, data, "scaledJobTemplate", scaledJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 
-	assert.True(t, WaitForJobCount(t, kc, testNamespace, 0, 60, 1),
-		"job count should be 0 after 1 minute")
+	assert.True(t, WaitForScaledJobCount(t, kc, scaledJobName, testNamespace, 0, 120, 1),
+		"job count should be 0 after 2 minute")
+	KubectlDeleteWithTemplate(t, data, "updateMetricTemplate", updateMetricTemplate)
 }

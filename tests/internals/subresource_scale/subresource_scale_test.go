@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -55,7 +56,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: 'nginx'`
+          image: 'nginxinc/nginx-unprivileged'`
 
 	argoRolloutTemplate = `apiVersion: argoproj.io/v1alpha1
 kind: Rollout
@@ -81,7 +82,7 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: nginx
+          image: nginxinc/nginx-unprivileged
 `
 
 	scaledObjectTemplate = `apiVersion: keda.sh/v1alpha1
@@ -117,7 +118,11 @@ func TestScaler(t *testing.T) {
 	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
 	data, templates := getTemplateData()
-
+	t.Cleanup(func() {
+		// cleanup
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+		cleanupArgo(t)
+	})
 	setupArgo(t, kc)
 
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
@@ -127,10 +132,6 @@ func TestScaler(t *testing.T) {
 	// test scaling
 	testScaleOut(t, kc)
 	testScaleIn(t, kc)
-
-	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
-	cleanupArgo(t, kc)
 }
 
 func setupArgo(t *testing.T, kc *kubernetes.Clientset) {
@@ -139,16 +140,16 @@ func setupArgo(t *testing.T, kc *kubernetes.Clientset) {
 		argoNamespace)
 	_, err := ExecuteCommand(cmdWithNamespace)
 
-	assert.NoErrorf(t, err, "cannot install argo resources - %s", err)
+	require.NoErrorf(t, err, "cannot install argo resources - %s", err)
 }
 
-func cleanupArgo(t *testing.T, kc *kubernetes.Clientset) {
+func cleanupArgo(t *testing.T) {
 	cmdWithNamespace := fmt.Sprintf("kubectl delete -n %s -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml",
 		argoNamespace)
 	_, err := ExecuteCommand(cmdWithNamespace)
 
 	assert.NoErrorf(t, err, "cannot delete argo resources - %s", err)
-	DeleteNamespace(t, kc, argoNamespace)
+	DeleteNamespace(t, argoNamespace)
 }
 
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset) {

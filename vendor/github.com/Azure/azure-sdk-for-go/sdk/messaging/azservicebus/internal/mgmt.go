@@ -10,8 +10,9 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/internal/uuid"
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/amqpwrap"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/exported"
-	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/internal/go-amqp"
+	"github.com/Azure/go-amqp"
 )
 
 type Disposition struct {
@@ -30,7 +31,7 @@ const (
 	DeferredDisposition  DispositionStatus = "defered"
 )
 
-func ReceiveDeferred(ctx context.Context, rpcLink RPCLink, linkName string, mode exported.ReceiveMode, sequenceNumbers []int64) ([]*amqp.Message, error) {
+func ReceiveDeferred(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, mode exported.ReceiveMode, sequenceNumbers []int64) ([]*amqp.Message, error) {
 	const messagesField, messageField = "messages", "message"
 
 	backwardsMode := uint32(0)
@@ -38,13 +39,13 @@ func ReceiveDeferred(ctx context.Context, rpcLink RPCLink, linkName string, mode
 		backwardsMode = 1
 	}
 
-	values := map[string]interface{}{
+	values := map[string]any{
 		"sequence-numbers":     sequenceNumbers,
 		"receiver-settle-mode": uint32(backwardsMode), // pick up messages with peek lock
 	}
 
 	msg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation": "com.microsoft:receive-by-sequence-number",
 		},
 		Value: values,
@@ -66,9 +67,9 @@ func ReceiveDeferred(ctx context.Context, rpcLink RPCLink, linkName string, mode
 	// 	of arrays
 	// 		of maps (always with one key: "message")
 	// 			of an array with raw encoded Service Bus messages
-	val, ok := rsp.Message.Value.(map[string]interface{})
+	val, ok := rsp.Message.Value.(map[string]any)
 	if !ok {
-		return nil, NewErrIncorrectType(messageField, map[string]interface{}{}, rsp.Message.Value)
+		return nil, NewErrIncorrectType(messageField, map[string]any{}, rsp.Message.Value)
 	}
 
 	rawMessages, ok := val[messagesField]
@@ -76,16 +77,16 @@ func ReceiveDeferred(ctx context.Context, rpcLink RPCLink, linkName string, mode
 		return nil, ErrMissingField(messagesField)
 	}
 
-	messages, ok := rawMessages.([]interface{})
+	messages, ok := rawMessages.([]any)
 	if !ok {
-		return nil, NewErrIncorrectType(messagesField, []interface{}{}, rawMessages)
+		return nil, NewErrIncorrectType(messagesField, []any{}, rawMessages)
 	}
 
 	transformedMessages := make([]*amqp.Message, len(messages))
 	for i := range messages {
-		rawEntry, ok := messages[i].(map[string]interface{})
+		rawEntry, ok := messages[i].(map[string]any)
 		if !ok {
-			return nil, NewErrIncorrectType(messageField, map[string]interface{}{}, messages[i])
+			return nil, NewErrIncorrectType(messageField, map[string]any{}, messages[i])
 		}
 
 		rawMessage, ok := rawEntry[messageField]
@@ -110,14 +111,14 @@ func ReceiveDeferred(ctx context.Context, rpcLink RPCLink, linkName string, mode
 	return transformedMessages, nil
 }
 
-func PeekMessages(ctx context.Context, rpcLink RPCLink, linkName string, fromSequenceNumber int64, messageCount int32) ([]*amqp.Message, error) {
+func PeekMessages(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, fromSequenceNumber int64, messageCount int32) ([]*amqp.Message, error) {
 	const messagesField, messageField = "messages", "message"
 
 	msg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation": "com.microsoft:peek-message",
 		},
-		Value: map[string]interface{}{
+		Value: map[string]any{
 			"from-sequence-number": fromSequenceNumber,
 			"message-count":        messageCount,
 		},
@@ -144,9 +145,9 @@ func PeekMessages(ctx context.Context, rpcLink RPCLink, linkName string, fromSeq
 	// 	of arrays
 	// 		of maps (always with one key: "message")
 	// 			of an array with raw encoded Service Bus messages
-	val, ok := rsp.Message.Value.(map[string]interface{})
+	val, ok := rsp.Message.Value.(map[string]any)
 	if !ok {
-		err = NewErrIncorrectType(messageField, map[string]interface{}{}, rsp.Message.Value)
+		err = NewErrIncorrectType(messageField, map[string]any{}, rsp.Message.Value)
 		return nil, err
 	}
 
@@ -156,17 +157,17 @@ func PeekMessages(ctx context.Context, rpcLink RPCLink, linkName string, fromSeq
 		return nil, err
 	}
 
-	messages, ok := rawMessages.([]interface{})
+	messages, ok := rawMessages.([]any)
 	if !ok {
-		err = NewErrIncorrectType(messagesField, []interface{}{}, rawMessages)
+		err = NewErrIncorrectType(messagesField, []any{}, rawMessages)
 		return nil, err
 	}
 
 	transformedMessages := make([]*amqp.Message, len(messages))
 	for i := range messages {
-		rawEntry, ok := messages[i].(map[string]interface{})
+		rawEntry, ok := messages[i].(map[string]any)
 		if !ok {
-			err = NewErrIncorrectType(messageField, map[string]interface{}{}, messages[i])
+			err = NewErrIncorrectType(messageField, map[string]any{}, messages[i])
 			return nil, err
 		}
 
@@ -212,12 +213,12 @@ func PeekMessages(ctx context.Context, rpcLink RPCLink, linkName string, fromSeq
 
 // RenewLocks renews the locks in a single 'com.microsoft:renew-lock' operation.
 // NOTE: this function assumes all the messages received on the same link.
-func RenewLocks(ctx context.Context, rpcLink RPCLink, linkName string, lockTokens []amqp.UUID) ([]time.Time, error) {
+func RenewLocks(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, lockTokens []amqp.UUID) ([]time.Time, error) {
 	renewRequestMsg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation": "com.microsoft:renew-lock",
 		},
-		Value: map[string]interface{}{
+		Value: map[string]any{
 			"lock-tokens": lockTokens,
 		},
 	}
@@ -238,35 +239,35 @@ func RenewLocks(ctx context.Context, rpcLink RPCLink, linkName string, lockToken
 	// extract the new lock renewal times from the response
 	// response.Message.
 
-	val, ok := response.Message.Value.(map[string]interface{})
+	val, ok := response.Message.Value.(map[string]any)
 	if !ok {
-		return nil, NewErrIncorrectType("Message.Value", map[string]interface{}{}, response.Message.Value)
+		return nil, NewErrIncorrectType("Message.Value", map[string]any{}, response.Message.Value)
 	}
 
 	expirations, ok := val["expirations"]
 
 	if !ok {
-		return nil, NewErrIncorrectType("Message.Value[\"expirations\"]", map[string]interface{}{}, response.Message.Value)
+		return nil, NewErrIncorrectType("Message.Value[\"expirations\"]", map[string]any{}, response.Message.Value)
 	}
 
 	asTimes, ok := expirations.([]time.Time)
 
 	if !ok {
-		return nil, NewErrIncorrectType("Message.Value[\"expirations\"] as times", map[string]interface{}{}, response.Message.Value)
+		return nil, NewErrIncorrectType("Message.Value[\"expirations\"] as times", map[string]any{}, response.Message.Value)
 	}
 
 	return asTimes, nil
 }
 
 // RenewSessionLocks renews a session lock.
-func RenewSessionLock(ctx context.Context, rpcLink RPCLink, linkName string, sessionID string) (time.Time, error) {
-	body := map[string]interface{}{
+func RenewSessionLock(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, sessionID string) (time.Time, error) {
+	body := map[string]any{
 		"session-id": sessionID,
 	}
 
 	msg := &amqp.Message{
 		Value: body,
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation": "com.microsoft:renew-session-lock",
 		},
 	}
@@ -279,10 +280,10 @@ func RenewSessionLock(ctx context.Context, rpcLink RPCLink, linkName string, ses
 		return time.Time{}, err
 	}
 
-	m, ok := resp.Message.Value.(map[string]interface{})
+	m, ok := resp.Message.Value.(map[string]any)
 
 	if !ok {
-		return time.Time{}, NewErrIncorrectType("Message.Value", map[string]interface{}{}, resp.Message.Value)
+		return time.Time{}, NewErrIncorrectType("Message.Value", map[string]any{}, resp.Message.Value)
 	}
 
 	lockedUntil, ok := m["expiration"].(time.Time)
@@ -295,12 +296,12 @@ func RenewSessionLock(ctx context.Context, rpcLink RPCLink, linkName string, ses
 }
 
 // GetSessionState retrieves state associated with the session.
-func GetSessionState(ctx context.Context, rpcLink RPCLink, linkName string, sessionID string) ([]byte, error) {
+func GetSessionState(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, sessionID string) ([]byte, error) {
 	amqpMsg := &amqp.Message{
-		Value: map[string]interface{}{
+		Value: map[string]any{
 			"session-id": sessionID,
 		},
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation": "com.microsoft:get-session-state",
 		},
 	}
@@ -317,10 +318,10 @@ func GetSessionState(ctx context.Context, rpcLink RPCLink, linkName string, sess
 		return nil, ErrAMQP(*resp)
 	}
 
-	asMap, ok := resp.Message.Value.(map[string]interface{})
+	asMap, ok := resp.Message.Value.(map[string]any)
 
 	if !ok {
-		return nil, NewErrIncorrectType("Value", map[string]interface{}{}, resp.Message.Value)
+		return nil, NewErrIncorrectType("Value", map[string]any{}, resp.Message.Value)
 	}
 
 	val := asMap["session-state"]
@@ -340,7 +341,7 @@ func GetSessionState(ctx context.Context, rpcLink RPCLink, linkName string, sess
 }
 
 // SetSessionState sets the state associated with the session.
-func SetSessionState(ctx context.Context, rpcLink RPCLink, linkName string, sessionID string, state []byte) error {
+func SetSessionState(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, sessionID string, state []byte) error {
 	uuid, err := uuid.New()
 
 	if err != nil {
@@ -348,11 +349,11 @@ func SetSessionState(ctx context.Context, rpcLink RPCLink, linkName string, sess
 	}
 
 	amqpMsg := &amqp.Message{
-		Value: map[string]interface{}{
+		Value: map[string]any{
 			"session-id":    sessionID,
 			"session-state": state,
 		},
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation":                 "com.microsoft:set-session-state",
 			"com.microsoft:tracking-id": uuid.String(),
 		},
@@ -373,16 +374,16 @@ func SetSessionState(ctx context.Context, rpcLink RPCLink, linkName string, sess
 	return nil
 }
 
-// SendDisposition allows you settle a message using the management link, rather than via your
+// SettleOnMgmtLink allows you settle a message using the management link, rather than via your
 // *amqp.Receiver. Use this if the receiver has been closed/lost or if the message isn't associated
 // with a link (ex: deferred messages).
-func SendDisposition(ctx context.Context, rpcLink RPCLink, linkName string, lockToken *amqp.UUID, state Disposition, propertiesToModify map[string]interface{}) error {
+func SettleOnMgmtLink(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, lockToken *amqp.UUID, state Disposition, propertiesToModify map[string]any) error {
 	if lockToken == nil {
 		err := errors.New("lock token on the message is not set, thus cannot send disposition")
 		return err
 	}
 
-	value := map[string]interface{}{
+	value := map[string]any{
 		"disposition-status": string(state.Status),
 		"lock-tokens":        []amqp.UUID{*lockToken},
 	}
@@ -400,7 +401,7 @@ func SendDisposition(ctx context.Context, rpcLink RPCLink, linkName string, lock
 	}
 
 	msg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation": "com.microsoft:update-disposition",
 		},
 		Value: value,
@@ -419,12 +420,12 @@ func SendDisposition(ctx context.Context, rpcLink RPCLink, linkName string, lock
 
 // ScheduleMessages will send a batch of messages to a Queue, schedule them to be enqueued, and return the sequence numbers
 // that can be used to cancel each message.
-func ScheduleMessages(ctx context.Context, rpcLink RPCLink, linkName string, enqueueTime time.Time, messages []*amqp.Message) ([]int64, error) {
-	if len(messages) <= 0 {
+func ScheduleMessages(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, enqueueTime time.Time, messages []*amqp.Message) ([]int64, error) {
+	if len(messages) == 0 {
 		return nil, errors.New("expected one or more messages")
 	}
 
-	transformed := make([]interface{}, 0, len(messages))
+	transformed := make([]any, 0, len(messages))
 	enqueueTimeAsUTC := enqueueTime.UTC()
 
 	for i := range messages {
@@ -454,7 +455,7 @@ func ScheduleMessages(ctx context.Context, rpcLink RPCLink, linkName string, enq
 			return nil, err
 		}
 
-		individualMessage := map[string]interface{}{
+		individualMessage := map[string]any{
 			"message-id": messages[i].Properties.MessageID,
 			"message":    encoded,
 		}
@@ -475,10 +476,10 @@ func ScheduleMessages(ctx context.Context, rpcLink RPCLink, linkName string, enq
 	}
 
 	msg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation": "com.microsoft:schedule-message",
 		},
-		Value: map[string]interface{}{
+		Value: map[string]any{
 			"messages": transformed,
 		},
 	}
@@ -499,30 +500,28 @@ func ScheduleMessages(ctx context.Context, rpcLink RPCLink, linkName string, enq
 	}
 
 	retval := make([]int64, 0, len(messages))
-	if rawVal, ok := resp.Message.Value.(map[string]interface{}); ok {
+	if rawVal, ok := resp.Message.Value.(map[string]any); ok {
 		const sequenceFieldName = "sequence-numbers"
 		if rawArr, ok := rawVal[sequenceFieldName]; ok {
 			if arr, ok := rawArr.([]int64); ok {
-				for i := range arr {
-					retval = append(retval, arr[i])
-				}
+				retval = append(retval, arr...)
 				return retval, nil
 			}
 			return nil, NewErrIncorrectType(sequenceFieldName, []int64{}, rawArr)
 		}
 		return nil, ErrMissingField(sequenceFieldName)
 	}
-	return nil, NewErrIncorrectType("value", map[string]interface{}{}, resp.Message.Value)
+	return nil, NewErrIncorrectType("value", map[string]any{}, resp.Message.Value)
 }
 
 // CancelScheduledMessages allows for removal of messages that have been handed to the Service Bus broker for later delivery,
 // but have not yet ben enqueued.
-func CancelScheduledMessages(ctx context.Context, rpcLink RPCLink, linkName string, seq []int64) error {
+func CancelScheduledMessages(ctx context.Context, rpcLink amqpwrap.RPCLink, linkName string, seq []int64) error {
 	msg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
+		ApplicationProperties: map[string]any{
 			"operation": "com.microsoft:cancel-scheduled-message",
 		},
-		Value: map[string]interface{}{
+		Value: map[string]any{
 			"sequence-numbers": seq,
 		},
 	}

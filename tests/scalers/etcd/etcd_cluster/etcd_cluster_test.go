@@ -8,10 +8,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
-	etcd "github.com/kedacore/keda/v2/tests/scalers/etcd/helper"
 )
 
 const (
@@ -23,6 +23,10 @@ var (
 	scaledObjectName = fmt.Sprintf("%s-so", testName)
 	deploymentName   = fmt.Sprintf("%s-deployment", testName)
 	jobName          = fmt.Sprintf("%s-job", testName)
+	etcdClientName   = fmt.Sprintf("%s-client", testName)
+	etcdEndpoints    = fmt.Sprintf("etcd-0.etcd-headless.%s:2379,etcd-1.%s:2379,etcd-2.etcd-headless.%s:2379", testNamespace, testNamespace, testNamespace)
+	minReplicaCount  = 0
+	maxReplicaCount  = 2
 )
 
 type templateData struct {
@@ -30,7 +34,11 @@ type templateData struct {
 	DeploymentName   string
 	JobName          string
 	ScaledObjectName string
+	MinReplicaCount  int
+	MaxReplicaCount  int
 	EtcdName         string
+	EtcdClientName   string
+	EtcdEndpoints    string
 }
 
 const (
@@ -51,7 +59,7 @@ spec:
     spec:
       containers:
       - name: my-app
-        image: nginx
+        image: nginxinc/nginx-unprivileged
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 80
@@ -64,8 +72,10 @@ metadata:
 spec:
   scaleTargetRef:
     name: {{.DeploymentName}}
-  pollingInterval: 30
+  pollingInterval: 15
   cooldownPeriod: 5
+  minReplicaCount: {{.MinReplicaCount}}
+  maxReplicaCount: {{.MaxReplicaCount}}
   advanced:
     horizontalPodAutoscalerConfig:
       name: keda-hpa-etcd-scaledobject
@@ -75,51 +85,26 @@ spec:
   triggers:
     - type: etcd
       metadata:
-        endpoints: {{.EtcdName}}-0.etcd-headless.{{.TestNamespace}}:2379,{{.EtcdName}}-1.etcd-headless.{{.TestNamespace}}:2379,{{.EtcdName}}-2.etcd-headless.{{.TestNamespace}}:2379
+        endpoints: {{.EtcdEndpoints}}
         watchKey: var
         value: '1.5'
+        activationValue: '5'
         watchProgressNotifyInterval: '10'
 `
-	insertJobTemplate = `apiVersion: batch/v1
-kind: Job
+	etcdClientTemplate = `
+apiVersion: v1
+kind: Pod
 metadata:
-  name: {{.JobName}}
+  name: {{.EtcdClientName}}
   namespace: {{.TestNamespace}}
 spec:
-  ttlSecondsAfterFinished: 0
-  template:
-    spec:
-      containers:
-      - name: etcd
-        image: gcr.io/etcd-development/etcd:v3.4.20
-        imagePullPolicy: IfNotPresent
-        command:
-        - sh
-        - -c
-        - "/usr/local/bin/etcdctl put var 9 --endpoints=http://{{.EtcdName}}-0.etcd-headless.{{.TestNamespace}}:2380,http://{{.EtcdName}}-1.etcd-headless.{{.TestNamespace}}:2380,http://{{.EtcdName}}-2.etcd-headless.{{.TestNamespace}}:2380"
-      restartPolicy: Never
-  backoffLimit: 4
-`
-	deleteJobTemplate = `apiVersion: batch/v1
-kind: Job
-metadata:
-  name: {{.JobName}}
-  namespace: {{.TestNamespace}}
-spec:
-  ttlSecondsAfterFinished: 0
-  template:
-    spec:
-      containers:
-      - name: etcd
-        image: gcr.io/etcd-development/etcd:v3.4.20
-        imagePullPolicy: IfNotPresent
-        command:
-        - sh
-        - -c
-        - "/usr/local/bin/etcdctl put var 0 --endpoints=http://{{.EtcdName}}-0.etcd-headless.{{.TestNamespace}}:2380,http://{{.EtcdName}}-1.etcd-headless.{{.TestNamespace}}:2380,http://{{.EtcdName}}-2.etcd-headless.{{.TestNamespace}}:2380"
-      restartPolicy: Never
-  backoffLimit: 4
-`
+  containers:
+  - name: {{.EtcdClientName}}
+    image: gcr.io/etcd-development/etcd:v3.4.10
+    command:
+      - sh
+      - -c
+      - "exec tail -f /dev/null"`
 )
 
 func TestScaler(t *testing.T) {
@@ -127,56 +112,80 @@ func TestScaler(t *testing.T) {
 	t.Log("--- setting up ---")
 	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
-
-	// Create kubernetes resources for testing
 	data, templates := getTemplateData()
-	CreateKubernetesResources(t, kc, testNamespace, data, templates)
+	t.Cleanup(func() {
+		KubectlDeleteWithTemplate(t, data, "etcdClientTemplate", etcdClientTemplate)
+		RemoveCluster(t, kc)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
+	CreateNamespace(t, kc, testNamespace)
 
 	// Create Etcd Cluster
-	etcd.InstallCluster(t, kc, testName, testNamespace)
+	KubectlApplyWithTemplate(t, data, "etcdClientTemplate", etcdClientTemplate)
+	InstallCluster(t, kc)
+	setVarValue(t, 0)
 
-	testActivation(t, kc, data)
-	testScaleIn(t, kc, data)
+	// Create kubernetes resources for testing
+	KubectlApplyMultipleWithTemplate(t, data, templates)
+
+	testActivation(t, kc)
 	testScaleOut(t, kc)
-
-	// cleanup
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
+	testScaleIn(t, kc)
 }
 
-func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
+func testActivation(t *testing.T, kc *kubernetes.Clientset) {
 	t.Log("--- testing activation ---")
-	KubectlApplyWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
+	setVarValue(t, 4)
 
-	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, 0, 10)
-}
-
-func testScaleIn(t *testing.T, kc *kubernetes.Clientset, data templateData) {
-	t.Log("--- testing scale in ---")
-	KubectlApplyWithTemplate(t, data, "insertJobTemplate", insertJobTemplate)
-
-	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 6, 60, 3),
-		"replica count should be %d after 3 minutes", 6)
+	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
 }
 
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset) {
 	t.Log("--- testing scale out ---")
-	KubectlApplyWithTemplate(t, data, "deleteJobTemplate", deleteJobTemplate)
+	setVarValue(t, 9)
 
-	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 0, 60, 3),
-		"replica count should be %d after 3 minutes", 0)
+	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
+		"replica count should be %d after 3 minutes", maxReplicaCount)
 }
 
-var data = templateData{
-	TestNamespace:    testNamespace,
-	DeploymentName:   deploymentName,
-	ScaledObjectName: scaledObjectName,
-	JobName:          jobName,
-	EtcdName:         testName,
+func testScaleIn(t *testing.T, kc *kubernetes.Clientset) {
+	t.Log("--- testing scale in ---")
+	setVarValue(t, 0)
+
+	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 3),
+		"replica count should be %d after 3 minutes", minReplicaCount)
 }
 
 func getTemplateData() (templateData, []Template) {
-	return data, []Template{
-		{Name: "deploymentTemplate", Config: deploymentTemplate},
-		{Name: "scaledObjectTemplate", Config: scaledObjectTemplate},
-	}
+	return templateData{
+			TestNamespace:    testNamespace,
+			DeploymentName:   deploymentName,
+			ScaledObjectName: scaledObjectName,
+			JobName:          jobName,
+			EtcdName:         testName,
+			EtcdClientName:   etcdClientName,
+			EtcdEndpoints:    etcdEndpoints,
+			MinReplicaCount:  minReplicaCount,
+			MaxReplicaCount:  maxReplicaCount,
+		}, []Template{
+			{Name: "deploymentTemplate", Config: deploymentTemplate},
+			{Name: "scaledObjectTemplate", Config: scaledObjectTemplate},
+		}
+}
+
+func setVarValue(t *testing.T, value int) {
+	_, _, err := ExecCommandOnSpecificPod(t, etcdClientName, testNamespace, fmt.Sprintf(`etcdctl put var %d --endpoints=%s`, value, etcdEndpoints))
+	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+}
+
+func InstallCluster(t *testing.T, kc *kubernetes.Clientset) {
+	_, err := ExecuteCommand(fmt.Sprintf(`helm upgrade --install --set persistence.enabled=false --set resourcesPreset=none --set auth.rbac.create=false --set replicaCount=3 --namespace %s --wait etcd oci://registry-1.docker.io/bitnamicharts/etcd`,
+		testNamespace))
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
+}
+
+func RemoveCluster(t *testing.T, kc *kubernetes.Clientset) {
+	_, err := ExecuteCommand(fmt.Sprintf(`helm delete --namespace %s --wait etcd`,
+		testNamespace))
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 }

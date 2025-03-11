@@ -9,6 +9,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	k8s "k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -183,41 +184,44 @@ spec:
 func TestNATSJetStreamScaler(t *testing.T) {
 	// Create k8s resources.
 	kc := GetKubernetesClient(t)
+	data, templates := nats.GetJetStreamDeploymentTemplateData(testNamespace, natsAddress, natsServerMonitoringEndpoint, messagePublishCount)
+	t.Cleanup(func() {
+		removeServerWithJetStream(t, natsNamespace)
+
+		DeleteNamespace(t, natsNamespace)
+		deleted := WaitForNamespaceDeletion(t, natsNamespace)
+		assert.Truef(t, deleted, "%s namespace not deleted", natsNamespace)
+		// Cleanup test namespace
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
 
 	// Deploy NATS server.
 	installServerWithJetStream(t, kc, natsNamespace)
-	assert.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, nats.NatsJetStreamName, natsNamespace, 1, 60, 3),
+	require.True(t, WaitForStatefulsetReplicaReadyCount(t, kc, nats.NatsJetStreamName, natsNamespace, 1, 60, 3),
 		"replica count should be %d after 3 minutes", minReplicaCount)
 
 	// Create k8s resources for testing.
-	data, templates := nats.GetJetStreamDeploymentTemplateData(testNamespace, natsAddress, natsServerMonitoringEndpoint, messagePublishCount)
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
 	// Create stream and consumer.
-	installStreamAndConsumer(t, testNamespace, natsAddress)
-	assert.True(t, WaitForJobSuccess(t, kc, "stream", testNamespace, 60, 3),
+	data.NatsStream = "standalone"
+	KubectlApplyWithTemplate(t, data, "scaledObjectTemplate", nats.ScaledObjectTemplate)
+	installStreamAndConsumer(t, data.NatsStream, testNamespace, natsAddress)
+	require.True(t, WaitForJobSuccess(t, kc, "stream", testNamespace, 60, 3),
 		"stream and consumer creation job should be success")
 
 	testActivation(t, kc, data)
 	testScaleOut(t, kc, data)
 	testScaleIn(t, kc)
-
-	// Cleanup nats namespace
-	removeServerWithJetStream(t, kc, natsNamespace)
-	DeleteNamespace(t, kc, natsNamespace)
-	deleted := WaitForNamespaceDeletion(t, kc, natsNamespace)
-	assert.Truef(t, deleted, "%s namespace not deleted", natsNamespace)
-	// Cleanup test namespace
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
 }
 
 // installStreamAndConsumer creates stream and consumer.
-func installStreamAndConsumer(t *testing.T, namespace, natsAddress string) {
+func installStreamAndConsumer(t *testing.T, stream, namespace, natsAddress string) {
 	data := nats.JetStreamTemplateData{
 		TestNamespace:  namespace,
 		NatsAddress:    natsAddress,
 		NatsConsumer:   nats.NatsJetStreamConsumerName,
-		NatsStream:     nats.NatsJetStreamStreamName,
+		NatsStream:     stream,
 		StreamReplicas: 1,
 	}
 
@@ -236,27 +240,27 @@ func installServerWithJetStream(t *testing.T, kc *k8s.Clientset, namespace strin
 }
 
 // removeServerWithJetStream will remove the NATS server and delete the namespace.
-func removeServerWithJetStream(t *testing.T, kc *k8s.Clientset, namespace string) {
+func removeServerWithJetStream(t *testing.T, namespace string) {
 	data := nats.JetStreamTemplateData{
 		NatsNamespace: namespace,
 		NatsVersion:   nats.NatsJetStreamServerVersion,
 	}
 
 	KubectlDeleteWithTemplate(t, data, "natsServerTemplate", natsServerTemplate)
-	DeleteNamespace(t, kc, namespace)
+	DeleteNamespace(t, namespace)
 }
 
 func testActivation(t *testing.T, kc *k8s.Clientset, data nats.JetStreamDeploymentTemplateData) {
 	t.Log("--- testing activation ---")
 	data.NumberOfMessages = 10
-	KubectlApplyWithTemplate(t, data, "activationPublishJobTemplate", nats.ActivationPublishJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "activationPublishJobTemplate", nats.ActivationPublishJobTemplate)
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
 }
 
 func testScaleOut(t *testing.T, kc *k8s.Clientset, data nats.JetStreamDeploymentTemplateData) {
 	t.Log("--- testing scale out ---")
-	KubectlApplyWithTemplate(t, data, "publishJobTemplate", nats.PublishJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "publishJobTemplate", nats.PublishJobTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
 		"replica count should be %d after 3 minutes", maxReplicaCount)

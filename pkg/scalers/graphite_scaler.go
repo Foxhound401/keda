@@ -13,12 +13,12 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
 const (
 	graphiteServerAddress              = "serverAddress"
-	graphiteMetricName                 = "metricName"
 	graphiteQuery                      = "query"
 	graphiteThreshold                  = "threshold"
 	graphiteActivationThreshold        = "activationThreshold"
@@ -36,7 +36,6 @@ type graphiteScaler struct {
 
 type graphiteMetadata struct {
 	serverAddress       string
-	metricName          string
 	query               string
 	threshold           float64
 	activationThreshold float64
@@ -46,7 +45,7 @@ type graphiteMetadata struct {
 	enableBasicAuth bool
 	username        string
 	password        string // +optional
-	scalerIndex     int
+	triggerIndex    int
 }
 
 type grapQueryResult []struct {
@@ -56,7 +55,7 @@ type grapQueryResult []struct {
 }
 
 // NewGraphiteScaler creates a new graphiteScaler
-func NewGraphiteScaler(config *ScalerConfig) (Scaler, error) {
+func NewGraphiteScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -77,7 +76,7 @@ func NewGraphiteScaler(config *ScalerConfig) (Scaler, error) {
 	}, nil
 }
 
-func parseGraphiteMetadata(config *ScalerConfig) (*graphiteMetadata, error) {
+func parseGraphiteMetadata(config *scalersconfig.ScalerConfig) (*graphiteMetadata, error) {
 	meta := graphiteMetadata{}
 
 	if val, ok := config.TriggerMetadata[graphiteServerAddress]; ok && val != "" {
@@ -90,12 +89,6 @@ func parseGraphiteMetadata(config *ScalerConfig) (*graphiteMetadata, error) {
 		meta.query = val
 	} else {
 		return nil, fmt.Errorf("no %s given", graphiteQuery)
-	}
-
-	if val, ok := config.TriggerMetadata[graphiteMetricName]; ok && val != "" {
-		meta.metricName = val
-	} else {
-		return nil, fmt.Errorf("no %s given", graphiteMetricName)
 	}
 
 	if val, ok := config.TriggerMetadata[graphiteQueryTime]; ok && val != "" {
@@ -124,7 +117,7 @@ func parseGraphiteMetadata(config *ScalerConfig) (*graphiteMetadata, error) {
 		meta.activationThreshold = t
 	}
 
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 
 	val, ok := config.TriggerMetadata["authMode"]
 	// no authMode specified
@@ -149,13 +142,16 @@ func parseGraphiteMetadata(config *ScalerConfig) (*graphiteMetadata, error) {
 }
 
 func (s *graphiteScaler) Close(context.Context) error {
+	if s.httpClient != nil {
+		s.httpClient.CloseIdleConnections()
+	}
 	return nil
 }
 
 func (s *graphiteScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("graphite-%s", s.metadata.metricName))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, "graphite"),
 		},
 		Target: GetMetricTargetMili(s.metricType, s.metadata.threshold),
 	}

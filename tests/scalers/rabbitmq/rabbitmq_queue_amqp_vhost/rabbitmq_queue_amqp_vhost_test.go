@@ -17,7 +17,7 @@ import (
 )
 
 // Load environment variables from .env file
-var _ = godotenv.Load("../../.env")
+var _ = godotenv.Load("../../../.env")
 
 const (
 	testName = "rmq-queue-amqp-vhost-test"
@@ -74,12 +74,15 @@ type templateData struct {
 func TestScaler(t *testing.T) {
 	// setup
 	t.Log("--- setting up ---")
-
-	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
 	data, templates := getTemplateData()
+	t.Cleanup(func() {
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+		RMQUninstall(t, rmqNamespace, user, password, vhost, WithoutOAuth())
+	})
 
-	RMQInstall(t, kc, rmqNamespace, user, password, vhost)
+	// Create kubernetes resources
+	RMQInstall(t, kc, rmqNamespace, user, password, vhost, WithoutOAuth())
 	CreateKubernetesResources(t, kc, testNamespace, data, templates)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 0, 60, 1),
@@ -88,11 +91,6 @@ func TestScaler(t *testing.T) {
 	testScaling(t, kc)
 
 	testActivationValue(t, kc)
-
-	// cleanup
-	t.Log("--- cleaning up ---")
-	DeleteKubernetesResources(t, kc, testNamespace, data, templates)
-	RMQUninstall(t, kc, rmqNamespace, user, password, vhost)
 }
 
 func getTemplateData() (templateData, []Template) {
@@ -113,8 +111,8 @@ func getTemplateData() (templateData, []Template) {
 func testScaling(t *testing.T, kc *kubernetes.Clientset) {
 	t.Log("--- testing scale out ---")
 	RMQPublishMessages(t, rmqNamespace, connectionString, queueName, messageCount)
-	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 4, 60, 1),
-		"replica count should be 4 after 1 minute")
+	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 4, 60, 3),
+		"replica count should be 4 after 3 minute")
 
 	t.Log("--- testing scale in ---")
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, 0, 60, 1),

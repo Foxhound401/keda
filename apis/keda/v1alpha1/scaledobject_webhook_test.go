@@ -18,146 +18,40 @@ package v1alpha1
 
 import (
 	"context"
-	"crypto/tls"
-	"fmt"
-	"net"
-	"path/filepath"
-	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	admissionv1beta1 "k8s.io/api/admission/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	v2 "k8s.io/api/autoscaling/v2"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/utils/pointer"
-	ctrl "sigs.k8s.io/controller-runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	//+kubebuilder:scaffold:imports
 )
-
-// These tests use Ginkgo (BDD-style Go testing framework). Refer to
-// http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
-
-var cfg *rest.Config
-var k8sClient client.Client
-var testEnv *envtest.Environment
-var ctx context.Context
-var cancel context.CancelFunc
-
-const (
-	workloadName = "deployment-name"
-	soName       = "test-so"
-)
-
-func TestAPIs(t *testing.T) {
-	RegisterFailHandler(Fail)
-
-	RunSpecs(t, "Webhook Suite")
-}
-
-var _ = BeforeSuite(func() {
-	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
-
-	ctx, cancel = context.WithCancel(context.Background())
-
-	By("bootstrapping test environment")
-	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: false,
-		WebhookInstallOptions: envtest.WebhookInstallOptions{
-			Paths: []string{filepath.Join("..", "..", "..", "config", "webhooks")},
-		},
-	}
-
-	var err error
-	// cfg is defined in this file globally.
-	cfg, err = testEnv.Start()
-	Expect(err).NotTo(HaveOccurred())
-	Expect(cfg).NotTo(BeNil())
-
-	scheme := runtime.NewScheme()
-	err = AddToScheme(scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = clientgoscheme.AddToScheme(scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	err = admissionv1beta1.AddToScheme(scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	//+kubebuilder:scaffold:scheme
-
-	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
-	Expect(err).NotTo(HaveOccurred())
-	Expect(k8sClient).NotTo(BeNil())
-
-	// start webhook server using Manager
-	webhookInstallOptions := &testEnv.WebhookInstallOptions
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:             scheme,
-		Host:               webhookInstallOptions.LocalServingHost,
-		Port:               webhookInstallOptions.LocalServingPort,
-		CertDir:            webhookInstallOptions.LocalServingCertDir,
-		LeaderElection:     false,
-		MetricsBindAddress: "0",
-	})
-	Expect(err).NotTo(HaveOccurred())
-
-	err = (&ScaledObject{}).SetupWebhookWithManager(mgr)
-	Expect(err).NotTo(HaveOccurred())
-
-	//+kubebuilder:scaffold:webhook
-
-	go func() {
-		defer GinkgoRecover()
-		err = mgr.Start(ctx)
-		Expect(err).NotTo(HaveOccurred())
-	}()
-
-	// wait for the webhook server to get ready
-	dialer := &net.Dialer{Timeout: time.Second}
-	addrPort := fmt.Sprintf("%s:%d", webhookInstallOptions.LocalServingHost, webhookInstallOptions.LocalServingPort)
-	Eventually(func() error {
-		conn, err := tls.DialWithDialer(dialer, "tcp", addrPort, &tls.Config{InsecureSkipVerify: true})
-		if err != nil {
-			return err
-		}
-		conn.Close()
-		return nil
-	}).Should(Succeed())
-
-})
 
 var _ = It("should validate the so creation when there isn't any hpa", func() {
 
 	namespaceName := "valid"
 	namespace := createNamespace(namespaceName)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("should validate the so creation when there are other SO for other workloads", func() {
 
 	namespaceName := "valid-multiple-so"
 	namespace := createNamespace(namespaceName)
-	so1 := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false)
-	so2 := createScaledObject("other-so-name", namespaceName, "other-workload", "apps/v1", "Deployment", false)
+	so1 := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so2 := createScaledObject("other-so-name", namespaceName, "other-workload", "apps/v1", "Deployment", false, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -165,15 +59,16 @@ var _ = It("should validate the so creation when there are other SO for other wo
 	err = k8sClient.Create(context.Background(), so1)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so2)
-	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so2)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("should validate the so creation when there are other HPA for other workloads", func() {
 
 	namespaceName := "valid-other-hpa"
 	namespace := createNamespace(namespaceName)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
 	hpa := createHpa("other-hpa-name", namespaceName, "other-workload", "apps/v1", "Deployment", nil)
 
 	err := k8sClient.Create(context.Background(), namespace)
@@ -182,8 +77,9 @@ var _ = It("should validate the so creation when there are other HPA for other w
 	err = k8sClient.Create(context.Background(), hpa)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("should validate the so creation when it's own hpa is already generated", func() {
@@ -191,7 +87,7 @@ var _ = It("should validate the so creation when it's own hpa is already generat
 	hpaName := "test-so-hpa"
 	namespaceName := "own-hpa"
 	namespace := createNamespace(namespaceName)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
 	hpa := createHpa(hpaName, namespaceName, workloadName, "apps/v1", "Deployment", so)
 
 	err := k8sClient.Create(context.Background(), namespace)
@@ -200,8 +96,9 @@ var _ = It("should validate the so creation when it's own hpa is already generat
 	err = k8sClient.Create(context.Background(), hpa)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("should validate the so update when it's own hpa is already generated", func() {
@@ -209,7 +106,7 @@ var _ = It("should validate the so update when it's own hpa is already generated
 	hpaName := "test-so-hpa"
 	namespaceName := "update-so"
 	namespace := createNamespace(namespaceName)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
 	hpa := createHpa(hpaName, namespaceName, workloadName, "apps/v1", "Deployment", so)
 
 	err := k8sClient.Create(context.Background(), namespace)
@@ -221,9 +118,10 @@ var _ = It("should validate the so update when it's own hpa is already generated
 	err = k8sClient.Create(context.Background(), so)
 	Expect(err).ToNot(HaveOccurred())
 
-	so.Spec.MaxReplicaCount = pointer.Int32(7)
-	err = k8sClient.Update(context.Background(), so)
-	Expect(err).ToNot(HaveOccurred())
+	so.Spec.MaxReplicaCount = ptr.To[int32](7)
+	Eventually(func() error {
+		return k8sClient.Update(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("shouldn't validate the so creation when there is another unmanaged hpa", func() {
@@ -232,7 +130,7 @@ var _ = It("shouldn't validate the so creation when there is another unmanaged h
 	namespaceName := "unmanaged-hpa"
 	namespace := createNamespace(namespaceName)
 	hpa := createHpa(hpaName, namespaceName, workloadName, "apps/v1", "Deployment", nil)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -240,8 +138,104 @@ var _ = It("shouldn't validate the so creation when there is another unmanaged h
 	err = k8sClient.Create(context.Background(), hpa)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).To(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the so creation when the replica counts are wrong", func() {
+	namespaceName := "wrong-replica-count"
+	namespace := createNamespace(namespaceName)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.MinReplicaCount = ptr.To[int32](10)
+	so.Spec.MaxReplicaCount = ptr.To[int32](5)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the so creation when the fallback is wrong", func() {
+	namespaceName := "wrong-fallback"
+	namespace := createNamespace(namespaceName)
+
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.Fallback = &Fallback{
+		FailureThreshold: -1,
+		Replicas:         -3,
+	}
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("should validate the so creation When the fallback are configured and the scaler is either CPU or memory.", func() {
+	namespaceName := "right-fallback-cpu-memory"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+	so.Spec.Fallback = &Fallback{
+		FailureThreshold: 3,
+		Replicas:         6,
+	}
+	for index := range so.Spec.Triggers {
+		so.Spec.Triggers[index].MetricType = "AverageValue"
+	}
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the so creation when there is another unmanaged hpa and so has transfer-hpa-ownership activated", func() {
+
+	hpaName := "test-unmanaged-hpa-ownership"
+	namespaceName := "unmanaged-hpa-ownership"
+	namespace := createNamespace(namespaceName)
+	hpa := createHpa(hpaName, namespaceName, workloadName, "apps/v1", "Deployment", nil)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{ScaledObjectTransferHpaOwnershipAnnotation: "true"}, hpaName)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), hpa)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the so creation when hpa has shared-ownership unactivated", func() {
+
+	hpaName := "test-hpa-disabled-validation-by-hpa-ownership"
+	namespaceName := "hpa-ownership"
+	namespace := createNamespace(namespaceName)
+	hpa := createHpa(hpaName, namespaceName, workloadName, "apps/v1", "Deployment", nil)
+	hpa.ObjectMeta.Annotations = map[string]string{ValidationsHpaOwnershipAnnotation: "false"}
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{ScaledObjectTransferHpaOwnershipAnnotation: "false"}, hpaName)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), hpa)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("shouldn't validate the so creation when there is another so", func() {
@@ -249,8 +243,8 @@ var _ = It("shouldn't validate the so creation when there is another so", func()
 	so2Name := "test-so2"
 	namespaceName := "managed-hpa"
 	namespace := createNamespace(namespaceName)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false)
-	so2 := createScaledObject(so2Name, namespaceName, workloadName, "apps/v1", "Deployment", false)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so2 := createScaledObject(so2Name, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -258,8 +252,9 @@ var _ = It("shouldn't validate the so creation when there is another so", func()
 	err = k8sClient.Create(context.Background(), so2)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).To(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
 })
 
 var _ = It("shouldn't validate the so creation when there is another hpa with custom apis", func() {
@@ -267,7 +262,7 @@ var _ = It("shouldn't validate the so creation when there is another hpa with cu
 	hpaName := "test-custom-hpa"
 	namespaceName := "custom-apis"
 	namespace := createNamespace(namespaceName)
-	so := createScaledObject(soName, namespaceName, workloadName, "custom-api", "custom-kind", false)
+	so := createScaledObject(soName, namespaceName, workloadName, "custom-api", "custom-kind", false, map[string]string{}, "")
 	hpa := createHpa(hpaName, namespaceName, workloadName, "custom-api", "custom-kind", nil)
 
 	err := k8sClient.Create(context.Background(), namespace)
@@ -276,8 +271,9 @@ var _ = It("shouldn't validate the so creation when there is another hpa with cu
 	err = k8sClient.Create(context.Background(), hpa)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).To(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
 })
 
 var _ = It("should validate the so creation with cpu and memory when deployment has requests", func() {
@@ -285,7 +281,7 @@ var _ = It("should validate the so creation with cpu and memory when deployment 
 	namespaceName := "deployment-has-requests"
 	namespace := createNamespace(namespaceName)
 	workload := createDeployment(namespaceName, true, true)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -293,8 +289,37 @@ var _ = It("should validate the so creation with cpu and memory when deployment 
 	err = k8sClient.Create(context.Background(), workload)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't validate the creation with cpu and memory when deployment is missing", func() {
+
+	namespaceName := "deployment-missing"
+	namespace := createNamespace(namespaceName)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("should validate the creation with cpu and memory when deployment is missing and dry-run is true", func() {
+
+	namespaceName := "deployment-missing-dry-run"
+	namespace := createNamespace(namespaceName)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so, client.DryRunAll)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("shouldn't validate the so creation with cpu and memory when deployment hasn't got memory request", func() {
@@ -302,7 +327,7 @@ var _ = It("shouldn't validate the so creation with cpu and memory when deployme
 	namespaceName := "deployment-no-memory-request"
 	namespace := createNamespace(namespaceName)
 	workload := createDeployment(namespaceName, true, false)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -310,8 +335,64 @@ var _ = It("shouldn't validate the so creation with cpu and memory when deployme
 	err = k8sClient.Create(context.Background(), workload)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).To(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+// This test checks whether the validation fails when the CPU and memory resource limits are missing in pod spec (in
+// deployment) and there are CPU and memory triggers in ScaledObject. This is a test for already existing behavior.
+// See github.com/kedacore/keda/issues/5348
+var _ = It("shouldn't validate the SO creation with CPU and memory when deployment doesn't have CPU and memory", func() {
+	namespaceName := "resource-default-limits-missing"
+	namespace := createNamespace(namespaceName)
+	deployment := createDeployment(namespaceName, false, false)
+	scaledObject := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+
+	// Create namespace
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	// Create deployment
+	err = k8sClient.Create(context.Background(), deployment)
+	Expect(err).ToNot(HaveOccurred())
+
+	// Create scaled object, asynchronously
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), scaledObject)
+	}).Should(HaveOccurred())
+})
+
+// This test checks whether the validation fails when the CPU and memory resource limits are missing in pod spec (in
+// deployment), but there are default limits specified in LimitRange in the same namespace, and there are CPU and
+// memory triggers in ScaledObject. This a test for newly added behavior after fixing the following issue.
+// See github.com/kedacore/keda/issues/5348
+var _ = It("should validate the SO creation with CPU and memory when deployment doesn't have CPU and memory, but LimitRange has the limits specified", func() {
+	namespaceName := "resource-default-limits-in-limitrange"
+	limitRangeName := "test-limit-range"
+	cpuLimit := resource.NewMilliQuantity(100, resource.DecimalSI)
+	memoryLimit := resource.NewMilliQuantity(100, resource.DecimalSI)
+	namespace := createNamespace(namespaceName)
+	deployment := createDeployment(namespaceName, false, false)
+	limitRange := createLimitRange(limitRangeName, namespaceName, v1.LimitTypeContainer, cpuLimit, memoryLimit)
+	scaledObject := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+
+	// Create namespace
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	// Create limit range
+	err = k8sClient.Create(context.Background(), limitRange)
+	Expect(err).ToNot(HaveOccurred())
+
+	// Create deployment
+	err = k8sClient.Create(context.Background(), deployment)
+	Expect(err).ToNot(HaveOccurred())
+
+	// Create scaled object, asynchronously
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), scaledObject)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("shouldn't validate the so creation with cpu and memory when deployment hasn't got cpu request", func() {
@@ -319,7 +400,7 @@ var _ = It("shouldn't validate the so creation with cpu and memory when deployme
 	namespaceName := "deployment-no-cpu-request"
 	namespace := createNamespace(namespaceName)
 	workload := createDeployment(namespaceName, false, true)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -327,8 +408,9 @@ var _ = It("shouldn't validate the so creation with cpu and memory when deployme
 	err = k8sClient.Create(context.Background(), workload)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).To(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
 })
 
 var _ = It("should validate the so creation with cpu and memory when statefulset has requests", func() {
@@ -336,7 +418,7 @@ var _ = It("should validate the so creation with cpu and memory when statefulset
 	namespaceName := "statefulset-has-requests"
 	namespace := createNamespace(namespaceName)
 	workload := createStatefulSet(namespaceName, true, true)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "StatefulSet", true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "StatefulSet", true, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -344,8 +426,9 @@ var _ = It("should validate the so creation with cpu and memory when statefulset
 	err = k8sClient.Create(context.Background(), workload)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = It("shouldn't validate the so creation with cpu and memory when statefulset hasn't got memory request", func() {
@@ -353,7 +436,7 @@ var _ = It("shouldn't validate the so creation with cpu and memory when stateful
 	namespaceName := "statefulset-no-memory-request"
 	namespace := createNamespace(namespaceName)
 	workload := createStatefulSet(namespaceName, true, false)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "StatefulSet", true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "StatefulSet", true, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -361,8 +444,9 @@ var _ = It("shouldn't validate the so creation with cpu and memory when stateful
 	err = k8sClient.Create(context.Background(), workload)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).To(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
 })
 
 var _ = It("shouldn't validate the so creation with cpu and memory when statefulset hasn't got cpu request", func() {
@@ -370,7 +454,7 @@ var _ = It("shouldn't validate the so creation with cpu and memory when stateful
 	namespaceName := "statefulset-no-cpu-request"
 	namespace := createNamespace(namespaceName)
 	workload := createStatefulSet(namespaceName, false, true)
-	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "StatefulSet", true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "StatefulSet", true, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
@@ -378,21 +462,593 @@ var _ = It("shouldn't validate the so creation with cpu and memory when stateful
 	err = k8sClient.Create(context.Background(), workload)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
-	Expect(err).To(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
 })
 
 var _ = It("should validate the so creation without cpu and memory when custom resources", func() {
 
 	namespaceName := "crd-not-resources"
 	namespace := createNamespace(namespaceName)
-	so := createScaledObject(soName, namespaceName, workloadName, "custom-api", "StatefulSet", true)
+	so := createScaledObject(soName, namespaceName, workloadName, "custom-api", "StatefulSet", true, map[string]string{}, "")
 
 	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = k8sClient.Create(context.Background(), so)
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate so creation when all requirements are met for scaling to zero with cpu scaler", func() {
+	namespaceName := "scale-to-zero-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, false)
+
+	so := createScaledObjectSTZ(soName, namespaceName, workloadName, 0, 5, true)
+
+	err := k8sClient.Create(context.Background(), namespace)
 	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't validate so creation with cpu scaler requirements not being met for scaling to 0", func() {
+	namespaceName := "scale-to-zero-min-replicas-bad"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, false)
+
+	so := createScaledObjectSTZ(soName, namespaceName, workloadName, 0, 5, false)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("should validate so creation when min replicas is > 0 with only cpu scaler given", func() {
+	namespaceName := "scale-to-zero-no-external-trigger-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, false)
+
+	so := createScaledObjectSTZ(soName, namespaceName, workloadName, 1, 5, false)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+
+})
+
+var _ = It("should not validate ScaledObject creation when deployment only provides cpu resource limits", func() {
+
+	namespaceName := "only-cpu-resource-limits-set"
+	namespace := createNamespace(namespaceName)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	workload := createDeployment(namespaceName, false, false)
+	workload.Spec.Template.Spec.Containers[0].Resources.Limits = v1.ResourceList{
+		v1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI),
+	}
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.Triggers = []ScaleTriggers{
+		{
+			Type: "cpu",
+			Metadata: map[string]string{
+				"value": "10",
+			},
+		},
+	}
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should not validate ScaledObject creation when deployment only provides memory resource limits", func() {
+
+	namespaceName := "only-memory-resource-limits-set"
+	namespace := createNamespace(namespaceName)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	workload := createDeployment(namespaceName, false, false)
+	workload.Spec.Template.Spec.Containers[0].Resources.Limits = v1.ResourceList{
+		v1.ResourceMemory: *resource.NewMilliQuantity(1024, resource.DecimalSI),
+	}
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.Triggers = []ScaleTriggers{
+		{
+			Type: "memory",
+			Metadata: map[string]string{
+				"value": "512Mi",
+			},
+		},
+	}
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate the so update if it's removing the finalizer even if it's invalid", func() {
+
+	namespaceName := "removing-finalizers"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", true, map[string]string{}, "")
+	so.ObjectMeta.Finalizers = append(so.ObjectMeta.Finalizers, "finalizer")
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+
+	workload.Spec.Template.Spec.Containers[0].Resources.Requests = nil
+	err = k8sClient.Update(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	so.ObjectMeta.Finalizers = []string{}
+	Eventually(func() error {
+		return k8sClient.Update(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldn't create so when stabilizationWindowSeconds exceeds 3600", func() {
+
+	namespaceName := "fail-so-creation"
+	namespace := createNamespace(namespaceName)
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.Advanced.HorizontalPodAutoscalerConfig = &HorizontalPodAutoscalerConfig{
+		Behavior: &v2.HorizontalPodAutoscalerBehavior{
+			ScaleDown: &v2.HPAScalingRules{
+				StabilizationWindowSeconds: ptr.To[int32](3700),
+			},
+		},
+	}
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).
+		WithTimeout(5 * time.Second).
+		Should(HaveOccurred())
+})
+
+var _ = It("should validate empty triggers in ScaledObject", func() {
+
+	namespaceName := "empty-triggers-set"
+	namespace := createNamespace(namespaceName)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+
+	workload := createDeployment(namespaceName, false, false)
+	workload.Spec.Template.Spec.Containers[0].Resources.Limits = v1.ResourceList{
+		v1.ResourceCPU: *resource.NewMilliQuantity(100, resource.DecimalSI),
+	}
+
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+
+	so := createScaledObject(soName, namespaceName, workloadName, "apps/v1", "Deployment", false, map[string]string{}, "")
+	so.Spec.Triggers = []ScaleTriggers{}
+
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+// ============================ SCALING MODIFIERS ============================ \\
+// =========================================================================== \\
+
+var _ = It("should validate the so creation with ScalingModifiers.Formula", func() {
+	namespaceName := "scaling-modifiers-formula-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	sm := ScalingModifiers{Target: "2", Formula: "workload_trig + cron_trig"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Name: "cron_trig",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "workload_trig",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("shouldnt validate the so creation with scalingModifiers.Formula but no target", func() {
+	namespaceName := "scaling-modifiers-formula-no-target-bad"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	sm := ScalingModifiers{Formula: "workload_trig + cron_trig"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Name: "cron_trig",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "workload_trig",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("shouldnt validate the so creation with ScalingModifiers when triggers dont have names", func() {
+	namespaceName := "scaling-modifiers-triggers-no-names-bad"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+
+	sm := ScalingModifiers{Formula: "workload_trig + cron_trig"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).Should(HaveOccurred())
+})
+
+var _ = It("should validate the so creation with ScalingModifiers when formula triggers do have names but not all triggers", func() {
+	namespaceName := "scaling-modifiers-specific-triggers-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+
+	sm := ScalingModifiers{Target: "2", Formula: "workload_trig + 1"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "workload_trig",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate the so creation with ScalingModifiers when formula casts to float already", func() {
+	namespaceName := "scaling-modifiers-cast-to-float-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, true, true)
+
+	sm := ScalingModifiers{Target: "2", Formula: "float(workload_trig + 1)"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "kubernetes-workload",
+			Name: "workload_trig",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate the so creation with ScalingModifiers.Formula - casting float from ternary operator", func() {
+	namespaceName := "scaling-modifiers-formula-casting-float-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	sm := ScalingModifiers{Target: "2", Formula: "float(workload_trig < 5 ? cron_trig + workload_trig : 5)"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Name: "cron_trig",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "workload_trig",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+// this test checks that internally, the casting to float happened successfully
+// to override the return value of ternary operator '?' - because it tries to compile
+// in webhook validator or during hpa setup and wouldnt compile without float return
+// value
+var _ = It("should validate the so creation with ScalingModifiers.Formula - ternary operator without casting float", func() {
+	namespaceName := "scaling-modifiers-formula-ternary-no-casting-float-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	sm := ScalingModifiers{Target: "2", Formula: "workload_trig < 5 ? cron_trig + workload_trig : 5"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Name: "cron_trig",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "workload_trig",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate the so creation with ScalingModifiers.Formula - count operator", func() {
+	namespaceName := "scaling-modifiers-formula-count-function-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	sm := ScalingModifiers{Target: "2", Formula: "count([trig_one,trig_two],{#>1}) > 1 ? 5 : 0"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Name: "trig_one",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "trig_two",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate the so creation with ScalingModifiers.Formula - complex ternary", func() {
+	namespaceName := "scaling-modifiers-formula-complex-ternary-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	sm := ScalingModifiers{Target: "2", Formula: "float(trig_one < 2 ? trig_one+trig_two >= 2 ? 5 : 10 : 0)"}
+
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Name: "trig_one",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "trig_two",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
+})
+
+var _ = It("should validate the so creation with ScalingModifiers.Formula - double float cast", func() {
+	namespaceName := "scaling-modifiers-formula-double-float-cast-good"
+	namespace := createNamespace(namespaceName)
+	workload := createDeployment(namespaceName, false, false)
+
+	sm := ScalingModifiers{Target: "2", Formula: "float(float(trig_two < 5 ? trig_one + trig_two : 5))"}
+	triggers := []ScaleTriggers{
+		{
+			Type: "cron",
+			Name: "trig_one",
+			Metadata: map[string]string{
+				"timezone":        "UTC",
+				"start":           "0 * * * *",
+				"end":             "1 * * * *",
+				"desiredReplicas": "1",
+			},
+		},
+		{
+			Type: "kubernetes-workload",
+			Name: "trig_two",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		},
+	}
+
+	so := createScaledObjectScalingModifiers(namespaceName, sm, triggers)
+
+	err := k8sClient.Create(context.Background(), namespace)
+	Expect(err).ToNot(HaveOccurred())
+	err = k8sClient.Create(context.Background(), workload)
+	Expect(err).ToNot(HaveOccurred())
+	Eventually(func() error {
+		return k8sClient.Create(context.Background(), so)
+	}).ShouldNot(HaveOccurred())
 })
 
 var _ = AfterSuite(func() {
@@ -402,13 +1058,17 @@ var _ = AfterSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 })
 
+// -------------------------------------------------------------------------- //
+// ----------------------------- HELP FUNCTIONS ----------------------------- //
+// -------------------------------------------------------------------------- //
+
 func createNamespace(name string) *v1.Namespace {
 	return &v1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 	}
 }
 
-func createScaledObject(name, namespace, targetName, targetAPI, targetKind string, hasCPUAndMemory bool) *ScaledObject {
+func createScaledObject(name, namespace, targetName, targetAPI, targetKind string, hasCPUAndMemory bool, annotations map[string]string, hpaName string) *ScaledObject {
 	triggers := []ScaleTriggers{
 		{
 			Type: "cron",
@@ -438,11 +1098,20 @@ func createScaledObject(name, namespace, targetName, targetAPI, targetKind strin
 		triggers = append(triggers, memoryTrigger)
 	}
 
+	advancedConfig := &AdvancedConfig{}
+
+	if hpaName != "" {
+		advancedConfig.HorizontalPodAutoscalerConfig = &HorizontalPodAutoscalerConfig{
+			Name: hpaName,
+		}
+	}
+
 	return &ScaledObject{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			UID:       types.UID(name),
+			Name:        name,
+			Namespace:   namespace,
+			UID:         types.UID(name),
+			Annotations: annotations,
 		},
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "ScaledObject",
@@ -454,10 +1123,11 @@ func createScaledObject(name, namespace, targetName, targetAPI, targetKind strin
 				APIVersion: targetAPI,
 				Kind:       targetKind,
 			},
-			IdleReplicaCount: pointer.Int32(1),
-			MinReplicaCount:  pointer.Int32(5),
-			MaxReplicaCount:  pointer.Int32(10),
+			IdleReplicaCount: ptr.To[int32](1),
+			MinReplicaCount:  ptr.To[int32](5),
+			MaxReplicaCount:  ptr.To[int32](10),
 			Triggers:         triggers,
+			Advanced:         advancedConfig,
 		},
 	}
 }
@@ -471,14 +1141,14 @@ func createHpa(name, namespace, targetName, targetAPI, targetKind string, owner 
 				APIVersion: targetAPI,
 				Kind:       targetKind,
 			},
-			MinReplicas: pointer.Int32(5),
+			MinReplicas: ptr.To[int32](5),
 			MaxReplicas: 10,
 			Metrics: []v2.MetricSpec{
 				{
 					Resource: &v2.ResourceMetricSource{
 						Name: v1.ResourceCPU,
 						Target: v2.MetricTarget{
-							AverageUtilization: pointer.Int32(30),
+							AverageUtilization: ptr.To[int32](30),
 							Type:               v2.AverageValueMetricType,
 						},
 					},
@@ -513,7 +1183,7 @@ func createDeployment(namespace string, hasCPU, hasMemory bool) *appsv1.Deployme
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: workloadName, Namespace: namespace},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: pointer.Int32(1),
+			Replicas: ptr.To[int32](1),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"test": "test",
@@ -558,7 +1228,7 @@ func createStatefulSet(namespace string, hasCPU, hasMemory bool) *appsv1.Statefu
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: workloadName, Namespace: namespace},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: pointer.Int32(1),
+			Replicas: ptr.To[int32](1),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"test": "test",
@@ -583,6 +1253,99 @@ func createStatefulSet(namespace string, hasCPU, hasMemory bool) *appsv1.Statefu
 								},
 							},
 						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func createScaledObjectSTZ(name string, namespace string, targetName string, minReplicas int32, maxReplicas int32, hasExternalTrigger bool) *ScaledObject {
+	triggers := []ScaleTriggers{
+		{
+			Type: "cpu",
+			Metadata: map[string]string{
+				"value": "10",
+			},
+		},
+	}
+
+	if hasExternalTrigger {
+		kubeWorkloadTrigger := ScaleTriggers{
+			Type: "kubernetes-workload",
+			Metadata: map[string]string{
+				"podSelector": "pod=workload-test",
+				"value":       "1",
+			},
+		}
+		triggers = append(triggers, kubeWorkloadTrigger)
+	}
+
+	return &ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			UID:       types.UID(name),
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ScaledObject",
+			APIVersion: "keda.sh",
+		},
+		Spec: ScaledObjectSpec{
+			ScaleTargetRef: &ScaleTarget{
+				Name: targetName,
+			},
+			MinReplicaCount: ptr.To[int32](minReplicas),
+			MaxReplicaCount: ptr.To[int32](maxReplicas),
+			CooldownPeriod:  ptr.To[int32](1),
+			Triggers:        triggers,
+		},
+	}
+}
+
+func createScaledObjectScalingModifiers(namespace string, sm ScalingModifiers, triggers []ScaleTriggers) *ScaledObject {
+	name := soName
+	targetName := workloadName
+	return &ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			UID:       types.UID(name),
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ScaledObject",
+			APIVersion: "keda.sh",
+		},
+		Spec: ScaledObjectSpec{
+			ScaleTargetRef: &ScaleTarget{
+				Name: targetName,
+			},
+			MinReplicaCount: ptr.To[int32](0),
+			MaxReplicaCount: ptr.To[int32](10),
+			CooldownPeriod:  ptr.To[int32](1),
+			Triggers:        triggers,
+			Advanced: &AdvancedConfig{
+				ScalingModifiers: sm,
+			},
+		},
+	}
+}
+
+// createLimitRange creates a LimitRange resource in the specified namespace. The CPU and memory are pointers for easy
+// use of constructor methods like NewQuantity, NewMilliQuantity, etc. directly at the caller.
+func createLimitRange(name, namespace string, limitType v1.LimitType, cpu, memory *resource.Quantity) *v1.LimitRange {
+	return &v1.LimitRange{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: v1.LimitRangeSpec{
+			Limits: []v1.LimitRangeItem{
+				{
+					Type: limitType,
+					Default: v1.ResourceList{
+						v1.ResourceCPU:    *cpu,
+						v1.ResourceMemory: *memory,
 					},
 				},
 			},

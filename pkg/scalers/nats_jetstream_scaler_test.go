@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 type parseNATSJetStreamMetadataTestData struct {
@@ -30,7 +32,7 @@ type parseNATSJetStreamMockResponsesTestData struct {
 
 type natsJetStreamMetricIdentifier struct {
 	metadataTestData *parseNATSJetStreamMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
@@ -63,6 +65,10 @@ var testNATSJetStreamMetadata = []parseNATSJetStreamMetadataTestData{
 	{map[string]string{"account": "$G", "stream": "mystream", "consumer": "pull_consumer", jetStreamLagThresholdMetricName: "6"}, map[string]string{"natsServerMonitoringEndpoint": "nats.nats:8222"}, false},
 	// Misconfigured lag threshold
 	{map[string]string{"account": "$G", "stream": "mystream", "consumer": "pull_consumer", jetStreamLagThresholdMetricName: "Y"}, map[string]string{"natsServerMonitoringEndpoint": "nats.nats:8222"}, true},
+	// All good + account from authParams
+	{map[string]string{"stream": "mystream", "consumer": "pull_consumer"}, map[string]string{"account": "$G", "natsServerMonitoringEndpoint": "nats.nats:8222"}, false},
+	// Misconfigured account
+	{map[string]string{"stream": "mystream", "consumer": "pull_consumer"}, map[string]string{"natsServerMonitoringEndpoint": "nats.nats:8222"}, true},
 }
 
 var natsJetStreamMetricIdentifiers = []natsJetStreamMetricIdentifier{
@@ -72,7 +78,7 @@ var natsJetStreamMetricIdentifiers = []natsJetStreamMetricIdentifier{
 
 func TestNATSJetStreamParseMetadata(t *testing.T) {
 	for _, testData := range testNATSJetStreamMetadata {
-		_, err := parseNATSJetStreamMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
+		_, err := parseNATSJetStreamMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, AuthParams: testData.authParams})
 		if err != nil && !testData.isError {
 			t.Error("Expected success but got error", err)
 		} else if testData.isError && err == nil {
@@ -84,7 +90,7 @@ func TestNATSJetStreamParseMetadata(t *testing.T) {
 func TestNATSJetStreamGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range natsJetStreamMetricIdentifiers {
 		ctx := context.Background()
-		meta, err := parseNATSJetStreamMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ScalerIndex: testData.scalerIndex})
+		meta, err := parseNATSJetStreamMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, TriggerIndex: testData.triggerIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -203,21 +209,6 @@ var testNATSJetStreamMockResponses = []parseNATSJetStreamMockResponsesTestData{
 			}},
 		}, true, false},
 	{
-		"Fail - Bad leader name (clustered)",
-		&natsJetStreamMetricIdentifier{
-			&parseNATSJetStreamMetadataTestData{
-				testNATSJetStreamGoodMetadata, map[string]string{}, false},
-			0, "s0-nats-jetstream-mystream",
-		},
-		&jetStreamEndpointResponse{
-			MetaCluster: metaCluster{ClusterSize: 3},
-			Accounts: []accountDetail{{Name: "$G",
-				Streams: []*streamDetail{{Name: "mystream",
-					Consumers: []consumerDetail{{Name: "pull_consumer", NumPending: 100, Cluster: consumerCluster{Leader: "leaderBad!!!!"}}},
-				}},
-			}},
-		}, false, true},
-	{
 		"Not Active - consumer missing - connected to node without consumer info (clustered)",
 		&natsJetStreamMetricIdentifier{
 			&parseNATSJetStreamMetadataTestData{
@@ -229,7 +220,11 @@ var testNATSJetStreamMockResponses = []parseNATSJetStreamMockResponsesTestData{
 			Accounts: []accountDetail{{Name: "$G",
 				Streams: []*streamDetail{{Name: "mystream"}},
 			}},
-		}, false, false},
+		}, false, true},
+}
+
+var testNATSJetStreamServerMockResponses = map[string][]byte{
+	"localhost:8222": []byte(`{"server_name": "leader", "cluster": {"urls": ["leader.localhost.nats.svc:8222","not-leader-1.localhost.nats.svc:8222", "not-leader-2.localhost.nats.svc:8222"]}}`),
 }
 
 func TestNATSJetStreamIsActive(t *testing.T) {
@@ -239,11 +234,10 @@ func TestNATSJetStreamIsActive(t *testing.T) {
 			t.Fatal("Could not parse mock response struct:", err)
 		}
 
-		srv := natsMockHTTPJetStreamServer(t, mockResponseJSON)
-		defer srv.Close()
+		client, srv := natsMockHTTPJetStreamServer(t, mockResponseJSON)
 
 		ctx := context.Background()
-		meta, err := parseNATSJetStreamMetadata(&ScalerConfig{TriggerMetadata: mockResponse.metadata.metadataTestData.metadata, ScalerIndex: mockResponse.metadata.scalerIndex})
+		meta, err := parseNATSJetStreamMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: mockResponse.metadata.metadataTestData.metadata, TriggerIndex: mockResponse.metadata.triggerIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -251,8 +245,8 @@ func TestNATSJetStreamIsActive(t *testing.T) {
 		mockJetStreamScaler := natsJetStreamScaler{
 			stream:     nil,
 			metadata:   meta,
-			httpClient: http.DefaultClient,
-			logger:     InitializeLogger(&ScalerConfig{TriggerMetadata: mockResponse.metadata.metadataTestData.metadata, ScalerIndex: mockResponse.metadata.scalerIndex}, "nats_jetstream_scaler"),
+			httpClient: client,
+			logger:     InitializeLogger(&scalersconfig.ScalerConfig{TriggerMetadata: mockResponse.metadata.metadataTestData.metadata, TriggerIndex: mockResponse.metadata.triggerIndex}, "nats_jetstream_scaler"),
 		}
 
 		_, isActive, err := mockJetStreamScaler.GetMetricsAndActivity(ctx, "metric_name")
@@ -271,13 +265,13 @@ func TestNATSJetStreamIsActive(t *testing.T) {
 
 func TestNewNATSJetStreamScaler(t *testing.T) {
 	// All Good
-	_, err := NewNATSJetStreamScaler(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0})
+	_, err := NewNATSJetStreamScaler(&scalersconfig.ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, TriggerIndex: 0})
 	if err != nil {
 		t.Error("Expected success for New NATS JetStream Scaler but got error", err)
 	}
 
 	// Fail - Empty account
-	_, err = NewNATSJetStreamScaler(&ScalerConfig{TriggerMetadata: map[string]string{"natsServerMonitoringEndpoint": "localhost:8222", "account": ""}})
+	_, err = NewNATSJetStreamScaler(&scalersconfig.ScalerConfig{TriggerMetadata: map[string]string{"natsServerMonitoringEndpoint": "localhost:8222", "account": ""}})
 	if err == nil {
 		t.Error("Expected error for parsing monitoring leader URL but got success")
 	}
@@ -290,15 +284,10 @@ func TestNATSJetStreamGetMetrics(t *testing.T) {
 			t.Fatal("Could not parse mock response struct:", err)
 		}
 
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		srv := natsMockHTTPJetStreamServer(t, mockResponseJSON)
-		defer func() {
-			srv.Close()
-			http.DefaultTransport = tr
-		}()
+		client, srv := natsMockHTTPJetStreamServer(t, mockResponseJSON)
 
 		ctx := context.Background()
-		meta, err := parseNATSJetStreamMetadata(&ScalerConfig{TriggerMetadata: mockResponse.metadata.metadataTestData.metadata, ScalerIndex: mockResponse.metadata.scalerIndex})
+		meta, err := parseNATSJetStreamMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: mockResponse.metadata.metadataTestData.metadata, TriggerIndex: mockResponse.metadata.triggerIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -306,8 +295,8 @@ func TestNATSJetStreamGetMetrics(t *testing.T) {
 		mockJetStreamScaler := natsJetStreamScaler{
 			stream:     nil,
 			metadata:   meta,
-			httpClient: http.DefaultClient,
-			logger:     InitializeLogger(&ScalerConfig{TriggerMetadata: mockResponse.metadata.metadataTestData.metadata, ScalerIndex: mockResponse.metadata.scalerIndex}, "nats_jetstream_scaler"),
+			httpClient: client,
+			logger:     InitializeLogger(&scalersconfig.ScalerConfig{TriggerMetadata: mockResponse.metadata.metadataTestData.metadata, TriggerIndex: mockResponse.metadata.triggerIndex}, "nats_jetstream_scaler"),
 		}
 
 		_, _, err = mockJetStreamScaler.GetMetricsAndActivity(ctx, "metric_name")
@@ -321,15 +310,18 @@ func TestNATSJetStreamGetMetrics(t *testing.T) {
 	}
 }
 
-func natsMockHTTPJetStreamServer(t *testing.T, mockResponseJSON []byte) *httptest.Server {
+func natsMockHTTPJetStreamServer(t *testing.T, mockResponseJSON []byte) (*http.Client, *httptest.Server) {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 
 	// redirect leader.localhost for the clustered test
-	http.DefaultTransport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if addr == "leader.localhost:8222" {
+	client := &http.Client{
+		Transport: &http.Transport{},
+	}
+	client.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if strings.HasSuffix(addr, ".localhost:8222") {
 			addr = "127.0.0.1:8222"
 		}
 		return dialer.DialContext(ctx, network, addr)
@@ -339,13 +331,27 @@ func natsMockHTTPJetStreamServer(t *testing.T, mockResponseJSON []byte) *httptes
 		switch r.URL.Path {
 		case "/jsz":
 			w.WriteHeader(http.StatusOK)
+			// if requesting from specific node and not a leader, which indicate clustered test
+			// send empty response
+			if strings.HasSuffix(r.Host, ".localhost:8222") && r.Host != "leader.localhost:8222" {
+				mockResponseJSON, _ = json.Marshal(&jetStreamEndpointResponse{})
+			}
 			_, err := w.Write(mockResponseJSON)
 			if err != nil {
 				t.Fatal("Could not write to the http server connection:", err)
 			}
 		case "/varz":
 			w.WriteHeader(http.StatusOK)
-			_, err := w.Write([]byte(`{"cluster": {"urls": ["leader.localhost.nats.svc:8222"]}}`))
+			res, ok := testNATSJetStreamServerMockResponses[r.Host]
+			if !ok {
+				// if given host is not a specific node (e.g. loadbalancer)
+				// get response from random node
+				for _, v := range testNATSJetStreamServerMockResponses {
+					res = v
+					break
+				}
+			}
+			_, err := w.Write(res)
 			if err != nil {
 				t.Fatal("Could not write to the http server connection:", err)
 			}
@@ -358,20 +364,17 @@ func natsMockHTTPJetStreamServer(t *testing.T, mockResponseJSON []byte) *httptes
 	srv.Listener = l
 	srv.Start()
 
-	return srv
+	return client, srv
 }
 
 func TestNATSJetStreamgetNATSJetstreamMonitoringData(t *testing.T) {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-
-	invalidJSONServer := natsMockHTTPJetStreamServer(t, []byte(`{invalidJSON}`))
+	client, invalidJSONServer := natsMockHTTPJetStreamServer(t, []byte(`{invalidJSON}`))
 	defer func() {
 		invalidJSONServer.Close()
-		http.DefaultTransport = tr
 	}()
 
 	ctx := context.Background()
-	meta, err := parseNATSJetStreamMetadata(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0})
+	meta, err := parseNATSJetStreamMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, TriggerIndex: 0})
 	if err != nil {
 		t.Fatal("Could not parse metadata:", err)
 	}
@@ -379,8 +382,8 @@ func TestNATSJetStreamgetNATSJetstreamMonitoringData(t *testing.T) {
 	mockJetStreamScaler := natsJetStreamScaler{
 		stream:     nil,
 		metadata:   meta,
-		httpClient: http.DefaultClient,
-		logger:     InitializeLogger(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0}, "nats_jetstream_scaler"),
+		httpClient: client,
+		logger:     InitializeLogger(&scalersconfig.ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, TriggerIndex: 0}, "nats_jetstream_scaler"),
 	}
 
 	err = mockJetStreamScaler.getNATSJetstreamMonitoringData(ctx, mockJetStreamScaler.metadata.monitoringURL)
@@ -390,10 +393,10 @@ func TestNATSJetStreamgetNATSJetstreamMonitoringData(t *testing.T) {
 }
 
 func TestNATSJetStreamGetNATSJetstreamNodeURL(t *testing.T) {
-	invalidJSONServer := natsMockHTTPJetStreamServer(t, []byte(`{invalidJSON}`))
+	client, invalidJSONServer := natsMockHTTPJetStreamServer(t, []byte(`{invalidJSON}`))
 	defer invalidJSONServer.Close()
 
-	meta, err := parseNATSJetStreamMetadata(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0})
+	meta, err := parseNATSJetStreamMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, TriggerIndex: 0})
 	if err != nil {
 		t.Fatal("Could not parse metadata:", err)
 	}
@@ -401,8 +404,8 @@ func TestNATSJetStreamGetNATSJetstreamNodeURL(t *testing.T) {
 	mockJetStreamScaler := natsJetStreamScaler{
 		stream:     nil,
 		metadata:   meta,
-		httpClient: http.DefaultClient,
-		logger:     InitializeLogger(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0}, "nats_jetstream_scaler"),
+		httpClient: client,
+		logger:     InitializeLogger(&scalersconfig.ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, TriggerIndex: 0}, "nats_jetstream_scaler"),
 	}
 
 	mockJetStreamScaler.metadata.monitoringURL = "234234:::::34234234;;;;really_bad_URL;;/"
@@ -414,10 +417,10 @@ func TestNATSJetStreamGetNATSJetstreamNodeURL(t *testing.T) {
 }
 
 func TestNATSJetStreamGetNATSJetstreamServerURL(t *testing.T) {
-	invalidJSONServer := natsMockHTTPJetStreamServer(t, []byte(`{invalidJSON}`))
+	client, invalidJSONServer := natsMockHTTPJetStreamServer(t, []byte(`{invalidJSON}`))
 	defer invalidJSONServer.Close()
 
-	meta, err := parseNATSJetStreamMetadata(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0})
+	meta, err := parseNATSJetStreamMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, TriggerIndex: 0})
 	if err != nil {
 		t.Fatal("Could not parse metadata:", err)
 	}
@@ -425,36 +428,20 @@ func TestNATSJetStreamGetNATSJetstreamServerURL(t *testing.T) {
 	mockJetStreamScaler := natsJetStreamScaler{
 		stream:     nil,
 		metadata:   meta,
-		httpClient: http.DefaultClient,
-		logger:     InitializeLogger(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0}, "nats_jetstream_scaler"),
+		httpClient: client,
+		logger:     InitializeLogger(&scalersconfig.ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, TriggerIndex: 0}, "nats_jetstream_scaler"),
 	}
 
 	mockJetStreamScaler.metadata.monitoringURL = "234234:::::34234234;;;;really_bad_URL;;/"
 
-	_, err = mockJetStreamScaler.getNATSJetStreamMonitoringServerURL()
+	_, err = mockJetStreamScaler.getNATSJetStreamMonitoringServerURL("")
 	if err == nil {
 		t.Error("Expected error for parsing monitoring server URL but got success")
 	}
 }
 
-func TestInvalidateNATSJetStreamCachedMonitoringData(t *testing.T) {
-	meta, err := parseNATSJetStreamMetadata(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0})
-	if err != nil {
-		t.Fatal("Could not parse metadata:", err)
-	}
-
-	mockJetStreamScaler := natsJetStreamScaler{
-		stream:     nil,
-		metadata:   meta,
-		httpClient: http.DefaultClient,
-		logger:     InitializeLogger(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0}, "nats_jetstream_scaler"),
-	}
-
-	mockJetStreamScaler.invalidateNATSJetStreamCachedMonitoringData()
-}
-
 func TestNATSJetStreamClose(t *testing.T) {
-	mockJetStreamScaler, err := NewNATSJetStreamScaler(&ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, ScalerIndex: 0})
+	mockJetStreamScaler, err := NewNATSJetStreamScaler(&scalersconfig.ScalerConfig{TriggerMetadata: testNATSJetStreamGoodMetadata, TriggerIndex: 0})
 	if err != nil {
 		t.Error("Expected success for New NATS JetStream Scaler but got error", err)
 	}

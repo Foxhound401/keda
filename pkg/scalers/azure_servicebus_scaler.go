@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus/admin"
 	az "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/go-logr/logr"
@@ -30,6 +32,7 @@ import (
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/scalers/azure"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -65,11 +68,12 @@ type azureServiceBusMetadata struct {
 	useRegex                bool
 	entityNameRegex         *regexp.Regexp
 	operation               string
-	scalerIndex             int
+	triggerIndex            int
+	timeout                 time.Duration
 }
 
 // NewAzureServiceBusScaler creates a new AzureServiceBusScaler
-func NewAzureServiceBusScaler(ctx context.Context, config *ScalerConfig) (Scaler, error) {
+func NewAzureServiceBusScaler(ctx context.Context, config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -92,10 +96,11 @@ func NewAzureServiceBusScaler(ctx context.Context, config *ScalerConfig) (Scaler
 }
 
 // Creates an azureServiceBusMetadata struct from input metadata/env variables
-func parseAzureServiceBusMetadata(config *ScalerConfig, logger logr.Logger) (*azureServiceBusMetadata, error) {
+func parseAzureServiceBusMetadata(config *scalersconfig.ScalerConfig, logger logr.Logger) (*azureServiceBusMetadata, error) {
 	meta := azureServiceBusMetadata{}
 	meta.entityType = none
 	meta.targetLength = defaultTargetMessageCount
+	meta.timeout = config.GlobalHTTPTimeout
 
 	// get target metric value
 	if val, ok := config.TriggerMetadata[messageCountMetricName]; ok {
@@ -198,7 +203,7 @@ func parseAzureServiceBusMetadata(config *ScalerConfig, logger logr.Logger) (*az
 		if len(meta.connection) == 0 {
 			return nil, fmt.Errorf("no connection setting given")
 		}
-	case kedav1alpha1.PodIdentityProviderAzure, kedav1alpha1.PodIdentityProviderAzureWorkload:
+	case kedav1alpha1.PodIdentityProviderAzureWorkload:
 		if val, ok := config.TriggerMetadata["namespace"]; ok {
 			envSuffixProvider := func(env az.Environment) (string, error) {
 				return env.ServiceBusEndpointSuffix, nil
@@ -214,10 +219,10 @@ func parseAzureServiceBusMetadata(config *ScalerConfig, logger logr.Logger) (*az
 		}
 
 	default:
-		return nil, fmt.Errorf("azure service bus doesn't support pod identity %s", config.PodIdentity)
+		return nil, fmt.Errorf("azure service bus doesn't support pod identity %s", config.PodIdentity.Provider)
 	}
 
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 
 	return &meta, nil
 }
@@ -227,7 +232,7 @@ func (s *azureServiceBusScaler) Close(context.Context) error {
 	return nil
 }
 
-// Returns the metric spec to be used by the HPA
+// GetMetricSpecForScaling returns the metric spec to be used by the HPA
 func (s *azureServiceBusScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	metricName := ""
 
@@ -246,7 +251,7 @@ func (s *azureServiceBusScaler) GetMetricSpecForScaling(context.Context) []v2.Me
 
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("azure-servicebus-%s", metricName))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(fmt.Sprintf("azure-servicebus-%s", metricName))),
 		},
 		Target: GetMetricTarget(s.metricType, s.metadata.targetLength),
 	}
@@ -291,18 +296,29 @@ func (s *azureServiceBusScaler) getServiceBusAdminClient() (*admin.Client, error
 	if s.client != nil {
 		return s.client, nil
 	}
+	var err error
+	var client *admin.Client
+	opts := &admin.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Transport: kedautil.CreateHTTPClient(s.metadata.timeout, false),
+		},
+	}
 
 	switch s.podIdentity.Provider {
 	case "", kedav1alpha1.PodIdentityProviderNone:
-		return admin.NewClientFromConnectionString(s.metadata.connection, nil)
-	case kedav1alpha1.PodIdentityProviderAzure, kedav1alpha1.PodIdentityProviderAzureWorkload:
-		creds, err := azure.NewChainedCredential(s.podIdentity.IdentityID, s.podIdentity.Provider)
-		if err != nil {
-			return nil, err
+		client, err = admin.NewClientFromConnectionString(s.metadata.connection, opts)
+	case kedav1alpha1.PodIdentityProviderAzureWorkload:
+		creds, chainedErr := azure.NewChainedCredential(s.logger, s.podIdentity)
+		if chainedErr != nil {
+			return nil, chainedErr
 		}
-		return admin.NewClient(s.metadata.fullyQualifiedNamespace, creds, nil)
+		client, err = admin.NewClient(s.metadata.fullyQualifiedNamespace, creds, opts)
+	default:
+		err = fmt.Errorf("incorrect podIdentity type")
 	}
-	return nil, fmt.Errorf("incorrect podIdentity type")
+
+	s.client = client
+	return client, err
 }
 
 func getQueueLength(ctx context.Context, adminClient *admin.Client, meta *azureServiceBusMetadata) (int64, error) {

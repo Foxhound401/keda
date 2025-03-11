@@ -1,6 +1,26 @@
-// Copyright (c) 2012 The gocql Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Content before git sha 34fdeebefcbf183ed7f916f931aa0586fdaa1b40
+ * Copyright (c) 2012, The Gocql authors,
+ * provided under the BSD-3-Clause License.
+ * See the NOTICE file distributed with this work for additional information.
+ */
 
 package gocql
 
@@ -32,6 +52,9 @@ var (
 		"com.ericsson.bss.cassandra.ecaudit.auth.AuditPasswordAuthenticator",
 		"com.amazon.helenus.auth.HelenusAuthenticator",
 		"com.ericsson.bss.cassandra.ecaudit.auth.AuditAuthenticator",
+		"com.scylladb.auth.SaslauthdAuthenticator",
+		"com.scylladb.auth.TransitionalAuthenticator",
+		"com.instaclustr.cassandra.auth.InstaclustrPasswordAuthenticator",
 	}
 )
 
@@ -422,7 +445,9 @@ func (s *startupCoordinator) options(ctx context.Context) error {
 
 func (s *startupCoordinator) startup(ctx context.Context, supported map[string][]string) error {
 	m := map[string]string{
-		"CQL_VERSION": s.conn.cfg.CQLVersion,
+		"CQL_VERSION":    s.conn.cfg.CQLVersion,
+		"DRIVER_NAME":    driverName,
+		"DRIVER_VERSION": driverVersion,
 	}
 
 	if s.conn.compressor != nil {
@@ -1373,6 +1398,12 @@ func (c *Conn) executeQuery(ctx context.Context, qry *Query) *Iter {
 			params:        params,
 			customPayload: qry.customPayload,
 		}
+
+		// Set "keyspace" and "table" property in the query if it is present in preparedMetadata
+		qry.routingInfo.mu.Lock()
+		qry.routingInfo.keyspace = info.request.keyspace
+		qry.routingInfo.table = info.request.table
+		qry.routingInfo.mu.Unlock()
 	} else {
 		frame = &writeQueryFrame{
 			statement:     qry.stmt,
@@ -1651,6 +1682,10 @@ func (c *Conn) querySystemPeers(ctx context.Context, version cassVersion) *Iter 
 	}
 }
 
+func (c *Conn) querySystemLocal(ctx context.Context) *Iter {
+	return c.query(ctx, "SELECT * FROM system.local WHERE key='local'")
+}
+
 func (c *Conn) awaitSchemaAgreement(ctx context.Context) (err error) {
 	const localSchemas = "SELECT schema_version FROM system.local WHERE key='local'"
 
@@ -1719,23 +1754,6 @@ func (c *Conn) awaitSchemaAgreement(ctx context.Context) (err error) {
 
 	// not exported
 	return fmt.Errorf("gocql: cluster schema versions not consistent: %+v", schemas)
-}
-
-func (c *Conn) localHostInfo(ctx context.Context) (*HostInfo, error) {
-	row, err := c.query(ctx, "SELECT * FROM system.local WHERE key='local'").rowMap()
-	if err != nil {
-		return nil, err
-	}
-
-	port := c.conn.RemoteAddr().(*net.TCPAddr).Port
-
-	// TODO(zariel): avoid doing this here
-	host, err := c.session.hostInfoFromMap(row, &HostInfo{connectAddress: c.host.connectAddress, port: port})
-	if err != nil {
-		return nil, err
-	}
-
-	return c.session.ring.addOrUpdate(host), nil
 }
 
 var (

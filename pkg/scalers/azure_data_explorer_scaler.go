@@ -28,6 +28,7 @@ import (
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/scalers/azure"
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -42,7 +43,7 @@ type azureDataExplorerScaler struct {
 
 const adxName = "azure-data-explorer"
 
-func NewAzureDataExplorerScaler(ctx context.Context, config *ScalerConfig) (Scaler, error) {
+func NewAzureDataExplorerScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -55,7 +56,8 @@ func NewAzureDataExplorerScaler(ctx context.Context, config *ScalerConfig) (Scal
 		return nil, fmt.Errorf("failed to parse azure data explorer metadata: %w", err)
 	}
 
-	client, err := azure.CreateAzureDataExplorerClient(ctx, metadata)
+	httpClient := kedautil.CreateHTTPClient(config.GlobalHTTPTimeout, false)
+	client, err := azure.CreateAzureDataExplorerClient(metadata, httpClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create azure data explorer client: %w", err)
 	}
@@ -70,7 +72,7 @@ func NewAzureDataExplorerScaler(ctx context.Context, config *ScalerConfig) (Scal
 	}, nil
 }
 
-func parseAzureDataExplorerMetadata(config *ScalerConfig, logger logr.Logger) (*azure.DataExplorerMetadata, error) {
+func parseAzureDataExplorerMetadata(config *scalersconfig.ScalerConfig, logger logr.Logger) (*azure.DataExplorerMetadata, error) {
 	metadata, err := parseAzureDataExplorerAuthParams(config, logger)
 	if err != nil {
 		return nil, err
@@ -117,7 +119,7 @@ func parseAzureDataExplorerMetadata(config *ScalerConfig, logger logr.Logger) (*
 	}
 
 	// Generate metricName.
-	metadata.MetricName = GenerateMetricNameWithIndex(config.ScalerIndex, kedautil.NormalizeString(fmt.Sprintf("%s-%s", adxName, metadata.DatabaseName)))
+	metadata.MetricName = GenerateMetricNameWithIndex(config.TriggerIndex, kedautil.NormalizeString(fmt.Sprintf("%s-%s", adxName, metadata.DatabaseName)))
 
 	activeDirectoryEndpoint, err := azure.ParseActiveDirectoryEndpoint(config.TriggerMetadata)
 	if err != nil {
@@ -137,11 +139,11 @@ func parseAzureDataExplorerMetadata(config *ScalerConfig, logger logr.Logger) (*
 	return metadata, nil
 }
 
-func parseAzureDataExplorerAuthParams(config *ScalerConfig, logger logr.Logger) (*azure.DataExplorerMetadata, error) {
+func parseAzureDataExplorerAuthParams(config *scalersconfig.ScalerConfig, logger logr.Logger) (*azure.DataExplorerMetadata, error) {
 	metadata := azure.DataExplorerMetadata{}
 
 	switch config.PodIdentity.Provider {
-	case kedav1alpha1.PodIdentityProviderAzure, kedav1alpha1.PodIdentityProviderAzureWorkload:
+	case kedav1alpha1.PodIdentityProviderAzureWorkload:
 		metadata.PodIdentity = config.PodIdentity
 	case "", kedav1alpha1.PodIdentityProviderNone:
 		logger.V(1).Info("Pod Identity is not provided. Trying to resolve clientId, clientSecret and tenantId.")
@@ -158,11 +160,16 @@ func parseAzureDataExplorerAuthParams(config *ScalerConfig, logger logr.Logger) 
 		}
 		metadata.ClientID = clientID
 
-		clientSecret, err := getParameterFromConfig(config, "clientSecret", true)
-		if err != nil {
-			return nil, err
+		var clientSecret string
+		if val, ok := config.AuthParams["clientSecret"]; ok && val != "" {
+			clientSecret = val
+		} else if val, ok = config.TriggerMetadata["clientSecretFromEnv"]; ok && val != "" {
+			clientSecret = val
+		} else {
+			return nil, fmt.Errorf("error parsing metadata. Details: clientSecret was not found in metadata. Check your ScaledObject configuration")
 		}
 		metadata.ClientSecret = clientSecret
+
 	default:
 		return nil, fmt.Errorf("error parsing auth params")
 	}
@@ -192,5 +199,8 @@ func (s azureDataExplorerScaler) GetMetricSpecForScaling(context.Context) []v2.M
 }
 
 func (s azureDataExplorerScaler) Close(context.Context) error {
+	if s.client != nil && s.client.HttpClient() != nil {
+		s.client.HttpClient().CloseIdleConnections()
+	}
 	return nil
 }

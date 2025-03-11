@@ -14,6 +14,7 @@ import (
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
 )
 
@@ -46,7 +47,7 @@ type huaweiCloudeyeMetadata struct {
 
 	huaweiAuthorization huaweiAuthorizationMetadata
 
-	scalerIndex int
+	triggerIndex int
 }
 
 type huaweiAuthorizationMetadata struct {
@@ -71,7 +72,7 @@ type huaweiAuthorizationMetadata struct {
 }
 
 // NewHuaweiCloudeyeScaler creates a new huaweiCloudeyeScaler
-func NewHuaweiCloudeyeScaler(config *ScalerConfig) (Scaler, error) {
+func NewHuaweiCloudeyeScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 	metricType, err := GetMetricTargetType(config)
 	if err != nil {
 		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
@@ -91,7 +92,7 @@ func NewHuaweiCloudeyeScaler(config *ScalerConfig) (Scaler, error) {
 	}, nil
 }
 
-func parseHuaweiCloudeyeMetadata(config *ScalerConfig, logger logr.Logger) (*huaweiCloudeyeMetadata, error) {
+func parseHuaweiCloudeyeMetadata(config *scalersconfig.ScalerConfig, logger logr.Logger) (*huaweiCloudeyeMetadata, error) {
 	meta := huaweiCloudeyeMetadata{}
 
 	meta.metricCollectionTime = defaultCloudeyeMetricCollectionTime
@@ -182,7 +183,7 @@ func parseHuaweiCloudeyeMetadata(config *ScalerConfig, logger logr.Logger) (*hua
 	}
 
 	meta.huaweiAuthorization = auth
-	meta.scalerIndex = config.ScalerIndex
+	meta.triggerIndex = config.TriggerIndex
 	return &meta, nil
 }
 
@@ -240,7 +241,7 @@ func gethuaweiAuthorization(authParams map[string]string) (huaweiAuthorizationMe
 	return meta, nil
 }
 
-func (s *huaweiCloudeyeScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
+func (s *huaweiCloudeyeScaler) GetMetricsAndActivity(_ context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	metricValue, err := s.GetCloudeyeMetrics()
 
 	if err != nil {
@@ -255,7 +256,7 @@ func (s *huaweiCloudeyeScaler) GetMetricsAndActivity(ctx context.Context, metric
 func (s *huaweiCloudeyeScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: GenerateMetricNameWithIndex(s.metadata.scalerIndex, kedautil.NormalizeString(fmt.Sprintf("huawei-cloudeye-%s", s.metadata.metricsName))),
+			Name: GenerateMetricNameWithIndex(s.metadata.triggerIndex, kedautil.NormalizeString(fmt.Sprintf("huawei-cloudeye-%s", s.metadata.metricsName))),
 		},
 		Target: GetMetricTargetMili(s.metricType, s.metadata.targetMetricValue),
 	}
@@ -328,7 +329,7 @@ func (s *huaweiCloudeyeScaler) GetCloudeyeMetrics() (float64, error) {
 
 	var metricValue float64
 
-	if metricdatas[0].Datapoints != nil && len(metricdatas[0].Datapoints) > 0 {
+	if len(metricdatas[0].Datapoints) > 0 {
 		v, ok := metricdatas[0].Datapoints[0][s.metadata.metricFilter].(float64)
 		if ok {
 			metricValue = v

@@ -25,6 +25,7 @@ import (
 	"k8s.io/metrics/pkg/apis/external_metrics/v1beta1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/kedacore/keda/v2/pkg/metricscollector"
 	"github.com/kedacore/keda/v2/pkg/metricsservice/api"
 	"github.com/kedacore/keda/v2/pkg/metricsservice/utils"
 	"github.com/kedacore/keda/v2/pkg/scaling"
@@ -42,24 +43,21 @@ type GrpcServer struct {
 }
 
 // GetMetrics returns metrics values in form of ExternalMetricValueList for specified ScaledObject reference
-func (s *GrpcServer) GetMetrics(ctx context.Context, in *api.ScaledObjectRef) (*api.Response, error) {
-	response := api.Response{}
+func (s *GrpcServer) GetMetrics(ctx context.Context, in *api.ScaledObjectRef) (*v1beta1.ExternalMetricValueList, error) {
 	v1beta1ExtMetrics := &v1beta1.ExternalMetricValueList{}
-	extMetrics, exportedMetrics, err := (*s.scalerHandler).GetScaledObjectMetrics(ctx, in.Name, in.Namespace, in.MetricName)
-	response.PromMetrics = exportedMetrics
+	extMetrics, err := (*s.scalerHandler).GetScaledObjectMetrics(ctx, in.Name, in.Namespace, in.MetricName)
 	if err != nil {
-		return &response, fmt.Errorf("error when getting metric values %w", err)
+		return v1beta1ExtMetrics, fmt.Errorf("error when getting metric values %w", err)
 	}
 
 	err = v1beta1.Convert_external_metrics_ExternalMetricValueList_To_v1beta1_ExternalMetricValueList(extMetrics, v1beta1ExtMetrics, nil)
 	if err != nil {
-		return &response, fmt.Errorf("error when converting metric values %w", err)
+		return v1beta1ExtMetrics, fmt.Errorf("error when converting metric values %w", err)
 	}
 
 	log.V(1).WithValues("scaledObjectName", in.Name, "scaledObjectNamespace", in.Namespace, "metrics", v1beta1ExtMetrics).Info("Providing metrics")
-	response.Metrics = v1beta1ExtMetrics
 
-	return &response, nil
+	return v1beta1ExtMetrics, nil
 }
 
 // NewGrpcServer creates a new instance of GrpcServer
@@ -94,7 +92,20 @@ func (s *GrpcServer) Start(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		s.server = grpc.NewServer(grpc.Creds(creds))
+
+		grpcServerOpts := []grpc.ServerOption{
+			grpc.Creds(creds),
+		}
+
+		if metricscollector.GetServerMetrics() != nil {
+			grpcServerOpts = append(
+				grpcServerOpts,
+				grpc.ChainStreamInterceptor(metricscollector.GetServerMetrics().StreamServerInterceptor()),
+				grpc.ChainUnaryInterceptor(metricscollector.GetServerMetrics().UnaryServerInterceptor()),
+			)
+		}
+
+		s.server = grpc.NewServer(grpcServerOpts...)
 		api.RegisterMetricsServiceServer(s.server, s)
 	}
 

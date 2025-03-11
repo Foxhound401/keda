@@ -3,13 +3,15 @@ package scalers
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/sqs"
-	"github.com/aws/aws-sdk-go/service/sqs/sqsiface"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kedacore/keda/v2/pkg/scalers/scalersconfig"
 )
 
 const (
@@ -25,6 +27,10 @@ const (
 
 	testAWSSQSErrorQueueURL   = "https://sqs.eu-west-1.amazonaws.com/account_id/Error"
 	testAWSSQSBadDataQueueURL = "https://sqs.eu-west-1.amazonaws.com/account_id/BadData"
+
+	testAWSSQSApproximateNumberOfMessagesVisible    = 200
+	testAWSSQSApproximateNumberOfMessagesNotVisible = 100
+	testAWSSQSApproximateNumberOfMessagesDelayed    = 50
 )
 
 var testAWSSQSEmptyResolvedEnv = map[string]string{}
@@ -48,31 +54,31 @@ type parseAWSSQSMetadataTestData struct {
 
 type awsSQSMetricIdentifier struct {
 	metadataTestData *parseAWSSQSMetadataTestData
-	scalerIndex      int
+	triggerIndex     int
 	name             string
 }
 
 type mockSqs struct {
-	sqsiface.SQSAPI
 }
 
-func (m *mockSqs) GetQueueAttributes(input *sqs.GetQueueAttributesInput) (*sqs.GetQueueAttributesOutput, error) {
+func (m *mockSqs) GetQueueAttributes(_ context.Context, input *sqs.GetQueueAttributesInput, _ ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error) {
 	switch *input.QueueUrl {
 	case testAWSSQSErrorQueueURL:
 		return nil, errors.New("some error")
 	case testAWSSQSBadDataQueueURL:
 		return &sqs.GetQueueAttributesOutput{
-			Attributes: map[string]*string{
-				"ApproximateNumberOfMessages":           aws.String("NotInt"),
-				"ApproximateNumberOfMessagesNotVisible": aws.String("NotInt"),
+			Attributes: map[string]string{
+				"ApproximateNumberOfMessages":           "NotInt",
+				"ApproximateNumberOfMessagesNotVisible": "NotInt",
 			},
 		}, nil
 	}
 
 	return &sqs.GetQueueAttributesOutput{
-		Attributes: map[string]*string{
-			"ApproximateNumberOfMessages":           aws.String("200"),
-			"ApproximateNumberOfMessagesNotVisible": aws.String("100"),
+		Attributes: map[string]string{
+			"ApproximateNumberOfMessages":           strconv.Itoa(testAWSSQSApproximateNumberOfMessagesVisible),
+			"ApproximateNumberOfMessagesNotVisible": strconv.Itoa(testAWSSQSApproximateNumberOfMessagesNotVisible),
+			"ApproximateNumberOfMessagesDelayed":    strconv.Itoa(testAWSSQSApproximateNumberOfMessagesDelayed),
 		},
 	}, nil
 }
@@ -138,8 +144,8 @@ var testAWSSQSMetadata = []parseAWSSQSMetadataTestData{
 		"awsRegion":   "eu-west-1"},
 		testAWSSQSAuthentication,
 		testAWSSQSEmptyResolvedEnv,
-		false,
-		"properly formed queue, invalid queueLength"},
+		true,
+		"invalid integer value for queueLength"},
 	{map[string]string{
 		"queueURL":              testAWSSQSProperQueueURL,
 		"queueLength":           "1",
@@ -156,8 +162,8 @@ var testAWSSQSMetadata = []parseAWSSQSMetadataTestData{
 		"awsRegion":             "eu-west-1"},
 		testAWSSQSAuthentication,
 		testAWSSQSEmptyResolvedEnv,
-		false,
-		"properly formed queue, invalid activationQueueLength"},
+		true,
+		"invalid integer value for activationQueueLength"},
 	{map[string]string{
 		"queueURL":    testAWSSQSProperQueueURL,
 		"queueLength": "1",
@@ -298,7 +304,7 @@ var testAWSSQSMetadata = []parseAWSSQSMetadataTestData{
 		map[string]string{
 			"QUEUE_URL": "",
 		},
-		true,
+		false,
 		"empty QUEUE_URL env value"},
 }
 
@@ -307,15 +313,86 @@ var awsSQSMetricIdentifiers = []awsSQSMetricIdentifier{
 	{&testAWSSQSMetadata[1], 1, "s1-aws-sqs-DeleteArtifactQ"},
 }
 
-var awsSQSGetMetricTestData = []*awsSqsQueueMetadata{
-	{queueURL: testAWSSQSProperQueueURL},
-	{queueURL: testAWSSQSErrorQueueURL},
-	{queueURL: testAWSSQSBadDataQueueURL},
+var awsSQSGetMetricTestData = []*parseAWSSQSMetadataTestData{
+	{map[string]string{
+		"queueURL":        testAWSSQSProperQueueURL,
+		"queueLength":     "1",
+		"awsRegion":       "eu-west-1",
+		"scaleOnInFlight": "false"},
+		testAWSSQSAuthentication,
+		testAWSSQSEmptyResolvedEnv,
+		false,
+		"not error with scaleOnInFlight disabled"},
+	{map[string]string{
+		"queueURL":        testAWSSQSProperQueueURL,
+		"queueLength":     "1",
+		"awsRegion":       "eu-west-1",
+		"scaleOnInFlight": "true"},
+		testAWSSQSAuthentication,
+		testAWSSQSEmptyResolvedEnv,
+		false,
+		"not error with scaleOnInFlight enabled"},
+	{map[string]string{
+		"queueURL":       testAWSSQSProperQueueURL,
+		"queueLength":    "1",
+		"awsRegion":      "eu-west-1",
+		"scaleOnDelayed": "false"},
+		testAWSSQSAuthentication,
+		testAWSSQSEmptyResolvedEnv,
+		false,
+		"not error with scaleOnDelayed disabled"},
+	{map[string]string{
+		"queueURL":       testAWSSQSProperQueueURL,
+		"queueLength":    "1",
+		"awsRegion":      "eu-west-1",
+		"scaleOnDelayed": "true"},
+		testAWSSQSAuthentication,
+		testAWSSQSEmptyResolvedEnv,
+		false,
+		"not error with scaleOnDelayed enabled"},
+	{map[string]string{
+		"queueURL":        testAWSSQSProperQueueURL,
+		"queueLength":     "1",
+		"awsRegion":       "eu-west-1",
+		"scaleOnInFlight": "false",
+		"scaleOnDelayed":  "false"},
+		testAWSSQSAuthentication,
+		testAWSSQSEmptyResolvedEnv,
+		false,
+		"not error with scaledOnInFlight and scaleOnDelayed disabled"},
+	{map[string]string{
+		"queueURL":        testAWSSQSProperQueueURL,
+		"queueLength":     "1",
+		"awsRegion":       "eu-west-1",
+		"scaleOnInFlight": "true",
+		"scaleOnDelayed":  "true"},
+		testAWSSQSAuthentication,
+		testAWSSQSEmptyResolvedEnv,
+		false,
+		"not error with scaledOnInFlight and scaleOnDelayed enabled"},
+	{map[string]string{
+		"queueURL":        testAWSSQSErrorQueueURL,
+		"queueLength":     "1",
+		"awsRegion":       "eu-west-1",
+		"scaleOnInFlight": "false"},
+		testAWSSQSAuthentication,
+		testAWSSQSEmptyResolvedEnv,
+		false,
+		"error queue"},
+	{map[string]string{
+		"queueURL":        testAWSSQSBadDataQueueURL,
+		"queueLength":     "1",
+		"awsRegion":       "eu-west-1",
+		"scaleOnInFlight": "true"},
+		testAWSSQSAuthentication,
+		testAWSSQSEmptyResolvedEnv,
+		false,
+		"bad data"},
 }
 
 func TestSQSParseMetadata(t *testing.T) {
 	for _, testData := range testAWSSQSMetadata {
-		_, err := parseAwsSqsQueueMetadata(&ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams}, logr.Discard())
+		_, err := parseAwsSqsQueueMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams})
 		if err != nil && !testData.isError {
 			t.Errorf("Expected success because %s got error, %s", testData.comment, err)
 		}
@@ -328,7 +405,7 @@ func TestSQSParseMetadata(t *testing.T) {
 func TestAWSSQSGetMetricSpecForScaling(t *testing.T) {
 	for _, testData := range awsSQSMetricIdentifiers {
 		ctx := context.Background()
-		meta, err := parseAwsSqsQueueMetadata(&ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ResolvedEnv: testData.metadataTestData.resolvedEnv, AuthParams: testData.metadataTestData.authParams, ScalerIndex: testData.scalerIndex}, logr.Discard())
+		meta, err := parseAwsSqsQueueMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadataTestData.metadata, ResolvedEnv: testData.metadataTestData.resolvedEnv, AuthParams: testData.metadataTestData.authParams, TriggerIndex: testData.triggerIndex})
 		if err != nil {
 			t.Fatal("Could not parse metadata:", err)
 		}
@@ -343,20 +420,116 @@ func TestAWSSQSGetMetricSpecForScaling(t *testing.T) {
 }
 
 func TestAWSSQSScalerGetMetrics(t *testing.T) {
-	for _, meta := range awsSQSGetMetricTestData {
+	for index, testData := range awsSQSGetMetricTestData {
+		meta, err := parseAwsSqsQueueMetadata(&scalersconfig.ScalerConfig{TriggerMetadata: testData.metadata, ResolvedEnv: testData.resolvedEnv, AuthParams: testData.authParams, TriggerIndex: index})
+		if err != nil {
+			t.Fatal("Could not parse metadata:", err)
+		}
 		scaler := awsSqsQueueScaler{"", meta, &mockSqs{}, logr.Discard()}
+
 		value, _, err := scaler.GetMetricsAndActivity(context.Background(), "MetricName")
-		switch meta.queueURL {
+		switch meta.QueueURL {
 		case testAWSSQSErrorQueueURL:
 			assert.Error(t, err, "expect error because of sqs api error")
 		case testAWSSQSBadDataQueueURL:
 			assert.Error(t, err, "expect error because of bad data return from sqs")
 		default:
-			if meta.scaleOnInFlight {
-				assert.EqualValues(t, int64(300.0), value[0].Value.Value())
-			} else {
-				assert.EqualValues(t, int64(200.0), value[0].Value.Value())
+			expectedMessages := testAWSSQSApproximateNumberOfMessagesVisible
+			if meta.ScaleOnInFlight {
+				expectedMessages += testAWSSQSApproximateNumberOfMessagesNotVisible
 			}
+			if meta.ScaleOnDelayed {
+				expectedMessages += testAWSSQSApproximateNumberOfMessagesDelayed
+			}
+			assert.EqualValues(t, int64(expectedMessages), value[0].Value.Value())
 		}
+	}
+}
+
+func TestProcessQueueLengthFromSqsQueueAttributesOutput(t *testing.T) {
+	scalerCreationFunc := func() *awsSqsQueueScaler {
+		return &awsSqsQueueScaler{
+			metadata: &awsSqsQueueMetadata{
+				awsSqsQueueMetricNames: []types.QueueAttributeName{types.QueueAttributeNameApproximateNumberOfMessages, types.QueueAttributeNameApproximateNumberOfMessagesNotVisible, types.QueueAttributeNameApproximateNumberOfMessagesDelayed},
+			},
+		}
+	}
+
+	tests := map[string]struct {
+		s           *awsSqsQueueScaler
+		attributes  *sqs.GetQueueAttributesOutput
+		expected    int64
+		errExpected bool
+	}{
+		"properly formed queue attributes": {
+			s: scalerCreationFunc(),
+			attributes: &sqs.GetQueueAttributesOutput{
+				Attributes: map[string]string{
+					"ApproximateNumberOfMessages":           "1",
+					"ApproximateNumberOfMessagesNotVisible": "0",
+					"ApproximateNumberOfMessagesDelayed":    "0",
+				},
+			},
+			expected:    1,
+			errExpected: false,
+		},
+		"missing ApproximateNumberOfMessages": {
+			s: scalerCreationFunc(),
+			attributes: &sqs.GetQueueAttributesOutput{
+				Attributes: map[string]string{},
+			},
+			expected:    -1,
+			errExpected: true,
+		},
+		"invalid ApproximateNumberOfMessages": {
+			s: scalerCreationFunc(),
+			attributes: &sqs.GetQueueAttributesOutput{
+				Attributes: map[string]string{
+					"ApproximateNumberOfMessages":           "NotInt",
+					"ApproximateNumberOfMessagesNotVisible": "0",
+					"ApproximateNumberOfMessagesDelayed":    "0",
+				},
+			},
+			expected:    -1,
+			errExpected: true,
+		},
+		"32 bit int upper bound": {
+			s: scalerCreationFunc(),
+			attributes: &sqs.GetQueueAttributesOutput{
+				Attributes: map[string]string{
+					"ApproximateNumberOfMessages":           "2147483647",
+					"ApproximateNumberOfMessagesNotVisible": "0",
+					"ApproximateNumberOfMessagesDelayed":    "0",
+				},
+			},
+			expected:    2147483647,
+			errExpected: false,
+		},
+		"32 bit int upper bound + 1": {
+			s: scalerCreationFunc(),
+			attributes: &sqs.GetQueueAttributesOutput{
+				Attributes: map[string]string{
+					"ApproximateNumberOfMessages":           "2147483648",
+					"ApproximateNumberOfMessagesNotVisible": "0",
+					"ApproximateNumberOfMessagesDelayed":    "0",
+				},
+			},
+			expected:    2147483648,
+			errExpected: false,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			result, err := test.s.processQueueLengthFromSqsQueueAttributesOutput(test.attributes)
+
+			if test.errExpected {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			assert.Equal(t, test.expected, result)
+		})
 	}
 }

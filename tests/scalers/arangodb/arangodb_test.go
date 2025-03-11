@@ -71,7 +71,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginx:1.14.2
+        image: nginxinc/nginx-unprivileged
         ports:
         - containerPort: 80
 `
@@ -133,7 +133,7 @@ spec:
   template:
     spec:
       containers:
-      - image: nginx:stable
+      - image: nginxinc/nginx-unprivileged
         name: test
         command: ["/bin/sh"]
         args: ["-c", "curl --location --request POST 'https://example-arangodb-cluster-ea.{{.TestNamespace}}.svc.cluster.local:8529/_db/{{.Database}}/_api/document/{{.Collection}}' --header 'Authorization: Basic cm9vdDo=' --data-raw '[{\"Hi\": \"Nathan\"}, {\"Hi\": \"Laura\"}]' -k"]
@@ -158,7 +158,7 @@ spec:
   template:
     spec:
       containers:
-      - image: nginx:stable
+      - image: nginxinc/nginx-unprivileged
         name: test
         command: ["/bin/sh"]
         args: ["-c", "curl --location --request POST 'https://example-arangodb-cluster-ea.{{.TestNamespace}}.svc.cluster.local:8529/_db/{{.Database}}/_api/document/{{.Collection}}' --header 'Authorization: Basic cm9vdDo=' --data-raw '[{\"Hi\": \"Harry\"}, {\"Hi\": \"Neha\"}]' -k"]
@@ -183,7 +183,7 @@ spec:
   template:
     spec:
       containers:
-      - image: nginx:stable
+      - image: nginxinc/nginx-unprivileged
         name: test
         command: ["/bin/sh"]
         args: ["-c", "curl --location --request POST 'https://example-arangodb-cluster-ea.{{.TestNamespace}}.svc.cluster.local:8529/_db/{{.Database}}/_api/cursor' --header 'Authorization: Basic cm9vdDo=' --data-raw '{\"query\": \"FOR doc in {{.Collection}} REMOVE doc in {{.Collection}}\"}' -k"]
@@ -201,14 +201,17 @@ spec:
 )
 
 func TestArangoDBScaler(t *testing.T) {
-	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
-
-	CreateNamespace(t, kc, testNamespace)
-	arangodb.InstallArangoDB(t, kc, testNamespace)
-	arangodb.SetupArangoDB(t, kc, testNamespace, arangoDBName, arangoDBCollection, arangoDBUsername)
-
 	data, templates := getTemplateData()
+	CreateNamespace(t, kc, testNamespace)
+	t.Cleanup(func() {
+		arangodb.UninstallArangoDB(t, testNamespace)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
+
+	// Create kubernetes resources
+	arangodb.InstallArangoDB(t, kc, testNamespace)
+	arangodb.SetupArangoDB(t, kc, testNamespace, arangoDBName, arangoDBCollection)
 	KubectlApplyMultipleWithTemplate(t, data, templates)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 3),
@@ -217,13 +220,6 @@ func TestArangoDBScaler(t *testing.T) {
 	testActivation(t, kc, data)
 	testScaleOut(t, kc, data)
 	testScaleIn(t, kc, data)
-
-	// cleanup
-	KubectlDeleteMultipleWithTemplate(t, data, templates)
-	arangodb.UninstallArangoDB(t, kc, testNamespace)
-
-	DeleteNamespace(t, kc, testNamespace)
-	WaitForNamespaceDeletion(t, kc, testNamespace)
 }
 
 func getTemplateData() (templateData, []Template) {
@@ -249,7 +245,7 @@ func getTemplateData() (templateData, []Template) {
 func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing activation ---")
 
-	KubectlApplyWithTemplate(t, data, "generateLowLevelDataJobTemplate", generateLowLevelDataJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "generateLowLevelDataJobTemplate", generateLowLevelDataJobTemplate)
 	assert.True(t, WaitForJobSuccess(t, kc, "generate-low-level-data-job", testNamespace, 5, 60), "test activation job failed")
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
@@ -258,7 +254,7 @@ func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale out ---")
 
-	KubectlApplyWithTemplate(t, data, "generateDataJobTemplate", generateDataJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "generateDataJobTemplate", generateDataJobTemplate)
 	assert.True(t, WaitForJobSuccess(t, kc, "generate-data-job", testNamespace, 5, 60), "test scale-out job failed")
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
@@ -268,7 +264,7 @@ func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 func testScaleIn(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale in ---")
 
-	KubectlApplyWithTemplate(t, data, "deleteDataJobTemplate", deleteDataJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "deleteDataJobTemplate", deleteDataJobTemplate)
 	assert.True(t, WaitForJobSuccess(t, kc, "delete-data-job", testNamespace, 5, 60), "test scale-in job failed")
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 5),

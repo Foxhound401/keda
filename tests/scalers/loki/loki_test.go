@@ -9,6 +9,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 
 	. "github.com/kedacore/keda/v2/tests/helper"
@@ -61,7 +62,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: nginx:1.14.2
+        image: nginxinc/nginx-unprivileged
         ports:
         - containerPort: 80
 ---
@@ -97,7 +98,7 @@ spec:
   template:
     spec:
       containers:
-      - image: quay.io/zroubalik/hey
+      - image: ghcr.io/kedacore/tests-hey
         name: test
         command: ["/bin/sh"]
         args: ["-c", "for i in $(seq 1 30);do echo \"keda-scaler $i\";sleep 1;done"]
@@ -123,7 +124,7 @@ spec:
   template:
     spec:
       containers:
-      - image: quay.io/zroubalik/hey
+      - image: ghcr.io/kedacore/tests-hey
         name: test
         command: ["/bin/sh"]
         args: ["-c", "for i in $(seq 1 30);do echo \"keda-scaler $i\";echo \"keda-scaler $((i*2))\";sleep 1;done"]
@@ -145,12 +146,16 @@ spec:
 // is directly tied to the KEDA HPA while the other is isolated that can be used for metrics
 // even when the KEDA deployment is at zero - the service points to both deployments
 func TestLokiScaler(t *testing.T) {
-	// Create kubernetes resources
 	kc := GetKubernetesClient(t)
+	data, templates := getTemplateData()
+	t.Cleanup(func() {
+		uninstallLoki(t, testNamespace)
+		DeleteKubernetesResources(t, testNamespace, data, templates)
+	})
+
 	installLoki(t, kc, testNamespace)
 
 	// Create kubernetes resources for testing
-	data, templates := getTemplateData()
 	KubectlApplyMultipleWithTemplate(t, data, templates)
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, minReplicaCount, 60, 3),
 		"replica count should be %d after 3 minutes", minReplicaCount)
@@ -158,22 +163,18 @@ func TestLokiScaler(t *testing.T) {
 	testActivation(t, kc, data)
 	testScaleOut(t, kc, data)
 	testScaleIn(t, kc)
-
-	// cleanup
-	KubectlDeleteMultipleWithTemplate(t, data, templates)
-	uninstallLoki(t, kc, testNamespace)
 }
 
 func testActivation(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing activation ---")
-	KubectlApplyWithTemplate(t, data, "generateLowLevelLoadJobTemplate", generateLowLevelLoadJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "generateLowLevelLoadJobTemplate", generateLowLevelLoadJobTemplate)
 
 	AssertReplicaCountNotChangeDuringTimePeriod(t, kc, deploymentName, testNamespace, minReplicaCount, 60)
 }
 
 func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
 	t.Log("--- testing scale out ---")
-	KubectlApplyWithTemplate(t, data, "generateLoadJobTemplate", generateLoadJobTemplate)
+	KubectlReplaceWithTemplate(t, data, "generateLoadJobTemplate", generateLoadJobTemplate)
 
 	assert.True(t, WaitForDeploymentReplicaReadyCount(t, kc, deploymentName, testNamespace, maxReplicaCount, 60, 3),
 		"replica count should be %d after 3 minutes", maxReplicaCount)
@@ -203,16 +204,14 @@ func getTemplateData() (templateData, []Template) {
 func installLoki(t *testing.T, kc *kubernetes.Clientset, namespace string) {
 	CreateNamespace(t, kc, namespace)
 	_, err := ExecuteCommand("helm repo add grafana https://grafana.github.io/helm-charts")
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 	_, err = ExecuteCommand("helm repo update")
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 	_, err = ExecuteCommand(fmt.Sprintf("helm upgrade --install loki grafana/loki-stack --wait --namespace=%s", namespace))
-	assert.NoErrorf(t, err, "cannot execute command - %s", err)
+	require.NoErrorf(t, err, "cannot execute command - %s", err)
 }
 
-func uninstallLoki(t *testing.T, kc *kubernetes.Clientset, namespace string) {
+func uninstallLoki(t *testing.T, namespace string) {
 	_, err := ExecuteCommand(fmt.Sprintf("helm uninstall loki --wait --namespace=%s", namespace))
 	assert.NoErrorf(t, err, "cannot execute command - %s", err)
-	DeleteNamespace(t, kc, namespace)
-	WaitForNamespaceDeletion(t, kc, namespace)
 }
